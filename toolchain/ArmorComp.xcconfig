@@ -1,0 +1,30 @@
+// ArmorComp.xcconfig — Xcode Build Settings Integration  (v0.26.0)
+//
+// HOW TO USE:
+//   1. Add this file to your Xcode project (File → Add Files to Project)
+//   2. In your target's Build Settings → "Based on": choose ArmorComp
+//      OR in the target's Info tab → Configurations → add this .xcconfig
+//   3. Add __attribute__((annotate("..."))) to functions you want to protect
+//
+// REQUIREMENTS:
+//   - brew llvm@17 installed:  brew install llvm@17
+//   - libArmorComp.dylib built in $(ARMORCOMP_TOOLCHAIN_DIR)/../lib/darwin-arm64/
+//
+// IMPORTANT: ARMORCOMP_TOOLCHAIN_DIR must be the absolute path to this file's
+// directory.  Either set it here or pass it via xcodebuild -DARMORCOMP_TOOLCHAIN_DIR=...
+
+// ── Path configuration ────────────────────────────────────────────────────────
+// Override ARMORCOMP_TOOLCHAIN_DIR to wherever you placed the toolchain folder.
+ARMORCOMP_TOOLCHAIN_DIR = $(SRCROOT)/armorcomp/toolchain
+
+// ── Compiler override ─────────────────────────────────────────────────────────
+// Replace Xcode's clang with the ArmorComp wrapper (brew clang@17 + plugin).
+// The wrapper forwards all Xcode flags (-target, -isysroot, -arch, etc.) unchanged.
+CC = $(ARMORCOMP_TOOLCHAIN_DIR)/bin/armorcomp-clang
+CXX = $(ARMORCOMP_TOOLCHAIN_DIR)/bin/armorcomp-clang++
+
+// ── Optional: enable specific passes globally via YAML config ─────────────────
+// Uncomment to apply passes to all functions via ARMORCOMP_CONFIG env var.
+// (See ArmorComp README for YAML config format.)
+// ARMORCOMP_CONFIG = $(SRCROOT)/armorcomp.yaml
+// GCC_PREPROCESSOR_DEFINITIONS = $(inherited) ARMORCOMP_CONFIG="$(ARMORCOMP_CONFIG)"

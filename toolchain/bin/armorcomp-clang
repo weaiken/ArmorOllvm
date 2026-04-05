@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# ArmorComp — macOS C compiler wrapper  (v0.26.0)
+#
+# Compiler resolution order:
+#   1. Bundled clang17  (toolchain/bin/clang17)  — zero-dependency delivery
+#   2. Homebrew clang@17  (/opt/homebrew/opt/llvm@17)  — dev fallback
+#
+# Build the bundled variant:
+#   cmake --build /path/to/ArmorComp/build --target package-toolchain-full
+
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARCH="$(uname -m)"   # arm64 (Apple Silicon) or x86_64 (Intel)
+
+# ── Locate plugin ──────────────────────────────────────────────────────────────
+PLUGIN="$SELF_DIR/../lib/darwin-${ARCH}/libArmorComp.dylib"
+if [[ ! -f "$PLUGIN" ]]; then
+  echo "armorcomp-clang: plugin not found: $PLUGIN" >&2
+  echo "  Build: cmake --build /path/to/ArmorComp/build --target package-toolchain-full" >&2
+  exit 1
+fi
+
+# ── Locate clang: bundled first, brew fallback ────────────────────────────────
+HOST_CLANG=""
+
+# Option 1: bundled clang17 (self-contained delivery)
+if [[ -x "$SELF_DIR/clang17" ]]; then
+  HOST_CLANG="$SELF_DIR/clang17"
+fi
+
+# Option 2: Homebrew clang@17 (developer machine with brew install llvm@17)
+if [[ -z "$HOST_CLANG" ]]; then
+  for PREFIX in "/opt/homebrew/opt/llvm@17" "/usr/local/opt/llvm@17"; do
+    if [[ -x "$PREFIX/bin/clang" ]]; then
+      HOST_CLANG="$PREFIX/bin/clang"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$HOST_CLANG" ]]; then
+  echo "armorcomp-clang: no suitable clang found." >&2
+  echo "  Either:" >&2
+  echo "    1. Run: cmake --build /path/to/ArmorComp/build --target package-toolchain-full" >&2
+  echo "       (bundles clang17 into this toolchain — no brew required)" >&2
+  echo "    2. Install brew llvm@17: brew install llvm@17" >&2
+  exit 1
+fi
+
+exec "$HOST_CLANG" -fpass-plugin="$PLUGIN" "$@"

@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# ArmorComp — macOS CMake compiler launcher  (v0.26.0)
+#
+# CMake invokes launchers as:
+#   ${LAUNCHER} ${COMPILER} ${COMPILE_FLAGS}
+#
+# We receive:
+#   $1 = NDK/Xcode clang (or clang++) path  ← we use this to find resource-dir
+#   $2...$n = actual compile flags           ← we forward these
+#
+# Strategy:
+#   1. From $1 (NDK clang), derive the NDK's resource-dir (contains stddef.h etc.)
+#   2. Drop $1, call brew clang@17 (or bundled clang17) with:
+#        -fpass-plugin=libArmorComp.dylib
+#        -resource-dir <NDK_RESOURCE_DIR>   ← NDK compiler builtins, not brew's
+#        <rest of flags from CMake>
+#
+# Set in android.cmake via:
+#   set(CMAKE_C_COMPILER_LAUNCHER   "${_AC_TOOLCHAIN_DIR}/bin/armorcomp-launcher")
+#   set(CMAKE_CXX_COMPILER_LAUNCHER "${_AC_TOOLCHAIN_DIR}/bin/armorcomp-launcher")
+
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARCH="$(uname -m)"
+
+# ── Locate plugin ──────────────────────────────────────────────────────────────
+PLUGIN="$SELF_DIR/../lib/darwin-${ARCH}/libArmorComp.dylib"
+if [[ ! -f "$PLUGIN" ]]; then
+  echo "armorcomp-launcher: plugin not found: $PLUGIN" >&2
+  exit 1
+fi
+
+# ── Inspect $1 (replaced compiler) ────────────────────────────────────────────
+REPLACED_COMPILER="${1:-}"
+
+# C vs C++: pick matching brew binary
+if [[ "$REPLACED_COMPILER" == *"++" ]]; then
+  CLANG_SUFFIX="++"
+else
+  CLANG_SUFFIX=""
+fi
+
+# Derive NDK resource-dir from the replaced compiler's prebuilt root.
+# NDK layout: .../prebuilt/<host>/bin/clang  →  .../prebuilt/<host>/lib/clang/<version>
+NDK_RESOURCE_DIR=""
+if [[ -n "$REPLACED_COMPILER" ]]; then
+  _NDK_BIN="$(dirname "$REPLACED_COMPILER")"
+  _NDK_PREBUILT="$(dirname "$_NDK_BIN")"
+  _CLANG_BASE="$_NDK_PREBUILT/lib/clang"
+  if [[ -d "$_CLANG_BASE" ]]; then
+    # Pick the highest version dir (e.g. 17.0.2)
+    NDK_RESOURCE_DIR="$(ls -d "$_CLANG_BASE"/[0-9]* 2>/dev/null | sort -V | tail -1 || true)"
+  fi
+fi
+
+# ── Locate host clang: bundled first, brew fallback ───────────────────────────
+HOST_CLANG=""
+
+if [[ -x "$SELF_DIR/clang17${CLANG_SUFFIX}" ]]; then
+  HOST_CLANG="$SELF_DIR/clang17${CLANG_SUFFIX}"
+fi
+
+if [[ -z "$HOST_CLANG" ]]; then
+  for PREFIX in "/opt/homebrew/opt/llvm@17" "/usr/local/opt/llvm@17"; do
+    if [[ -x "$PREFIX/bin/clang${CLANG_SUFFIX}" ]]; then
+      HOST_CLANG="$PREFIX/bin/clang${CLANG_SUFFIX}"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$HOST_CLANG" ]]; then
+  echo "armorcomp-launcher: no suitable clang${CLANG_SUFFIX} found." >&2
+  echo "  Run: cmake --build ... --target package-toolchain-full" >&2
+  echo "  Or:  brew install llvm@17" >&2
+  exit 1
+fi
+
+# ── Drop $1 (replaced compiler), build new invocation ────────────────────────
+shift
+
+EXTRA_FLAGS=()
+EXTRA_FLAGS+=("-fpass-plugin=$PLUGIN")
+
+# Inject NDK resource-dir so brew clang finds NDK builtins (stddef.h etc.)
+# Only add if not already present in the flags (avoid duplicates on re-runs).
+if [[ -n "$NDK_RESOURCE_DIR" && "$*" != *"-resource-dir"* ]]; then
+  EXTRA_FLAGS+=("-resource-dir" "$NDK_RESOURCE_DIR")
+fi
+
+exec "$HOST_CLANG" "${EXTRA_FLAGS[@]}" "$@"

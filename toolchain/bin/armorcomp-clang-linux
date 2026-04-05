@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# ArmorComp — Linux C compiler wrapper
+#
+# On Linux, use LLVM 17 from apt (llvm-17 package).
+# Install: sudo apt install llvm-17 clang-17
+
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+PLUGIN="$SELF_DIR/../lib/linux-x86_64/libArmorComp.so"
+if [[ ! -f "$PLUGIN" ]]; then
+  echo "armorcomp-clang-linux: plugin not found: $PLUGIN" >&2
+  echo "  Build it with: cmake --build /path/to/ArmorComp/build --target ArmorComp" >&2
+  exit 1
+fi
+
+# Search common LLVM 17 install paths on Linux
+for CLANG in \
+    "/usr/lib/llvm-17/bin/clang" \
+    "/usr/local/bin/clang-17" \
+    "/usr/bin/clang-17"; do
+  if [[ -x "$CLANG" ]]; then
+    HOST_CLANG="$CLANG"
+    break
+  fi
+done
+if [[ -z "${HOST_CLANG:-}" ]]; then
+  echo "armorcomp-clang-linux: clang-17 not found." >&2
+  echo "  Install with: sudo apt install clang-17" >&2
+  exit 1
+fi
+
+exec "$HOST_CLANG" -fpass-plugin="$PLUGIN" "$@"

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# ArmorComp — Linux C++ compiler wrapper
+
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+PLUGIN="$SELF_DIR/../lib/linux-x86_64/libArmorComp.so"
+if [[ ! -f "$PLUGIN" ]]; then
+  echo "armorcomp-clang++-linux: plugin not found: $PLUGIN" >&2
+  exit 1
+fi
+
+for CLANGXX in \
+    "/usr/lib/llvm-17/bin/clang++" \
+    "/usr/local/bin/clang++-17" \
+    "/usr/bin/clang++-17"; do
+  if [[ -x "$CLANGXX" ]]; then
+    HOST_CLANGXX="$CLANGXX"
+    break
+  fi
+done
+if [[ -z "${HOST_CLANGXX:-}" ]]; then
+  echo "armorcomp-clang++-linux: clang++-17 not found. Install: sudo apt install clang-17" >&2
+  exit 1
+fi
+
+exec "$HOST_CLANGXX" -fpass-plugin="$PLUGIN" "$@"

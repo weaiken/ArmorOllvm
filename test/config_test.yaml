@@ -1,0 +1,34 @@
+# ArmorComp configuration file example
+#
+# This file demonstrates config-driven obfuscation: no source annotations
+# needed.  Pass this to clang via:
+#
+#   clang -fpass-plugin=ArmorComp.dylib \
+#         -mllvm -armorcomp-config=config_test.yaml \
+#         source.c -o output
+#
+# Config rules
+# ─────────────
+# Each entry under `functions:` has either:
+#   name:    — exact function name match
+#   pattern: — POSIX ERE matched against the function name
+# and a required `passes:` list.
+#
+# Rules are evaluated top-to-bottom; the FIRST matching rule wins.
+# Valid pass names: cff, bcf, sub, mba, split, strenc, icall, ibr, igv, spo
+#
+# Tip: use anchored patterns (^...$) to avoid partial matches.
+
+functions:
+  # Protect config_classify with CFF + BCF + IGV + SPO (no source annotation needed)
+  - name: "config_classify"
+    passes: [cff, bcf, igv, spo]
+
+  # Protect all functions whose names start with "Java_" with a full stack
+  # (typical Android JNI export pattern)
+  - pattern: "^Java_"
+    passes: [cff, bcf, sub, mba, icall, ibr, igv]
+
+  # Protect all functions whose names contain "secret" (case-sensitive)
+  - pattern: "secret"
+    passes: [cff, bcf, sub, strenc]
