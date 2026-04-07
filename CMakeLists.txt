@@ -72,6 +72,9 @@ add_library(ArmorComp SHARED
   lib/VMPLifter.cpp                  # VMP: LLVM IR → bytecode translator
   lib/VMPCodeGen.cpp                 # VMP: VM dispatcher LLVM IR generator
   lib/VMPPass.cpp                    # VMP: Virtual Machine Protection pass
+  lib/AntiDebugPass.cpp
+  lib/AntiTamperPass.cpp
+  lib/ControlFlowRandomizationPass.cpp
 )
 
 # Pass plugins must NOT link against LLVM shared libs directly —
@@ -1356,6 +1359,84 @@ add_custom_target(test-vmp
     -o ${CMAKE_BINARY_DIR}/vmp_test_aarch64
   DEPENDS ArmorComp
   COMMENT "Compiling test/vmp_test.c with VMP pass → ARM64 Android ELF"
+)
+
+# ---- Test target: AntiDebugPass (ADB) validation ----------------------
+# ADB auto-runs for annotate("adb") functions.
+# Injects multi-layer anti-debug detection: ptrace(PTRACE_TRACEME),
+# clock_gettime delta check, LD_PRELOAD/DYLD_INSERT_LIBRARIES env check.
+#
+# Expected stderr:
+#   [ArmorComp][ADB] anti-debug checks injected: secure_login (N BB(s))
+#   [ArmorComp][ADB] anti-debug checks injected: verify_checksum (N BB(s))
+#
+# Expected output (when run on device/emulator):
+#   login result = 1
+#   checksum = 42
+#   ALL TESTS PASSED
+add_custom_target(test-adb
+  COMMAND ${BREW_CLANG}
+    -target aarch64-linux-android21
+    --sysroot=${NDK_SYSROOT}
+    -resource-dir=${NDK_RESOURCE_DIR}
+    -fpass-plugin=$<TARGET_FILE:ArmorComp>
+    -O0
+    ${CMAKE_SOURCE_DIR}/test/adb_test.c
+    -o ${CMAKE_BINARY_DIR}/adb_test_aarch64
+  DEPENDS ArmorComp
+  COMMENT "Compiling test/adb_test.c with AntiDebug pass → ARM64 Android ELF"
+)
+
+# ---- Test target: AntiTamperPass (AT) validation -------------------
+# AT auto-runs for annotate("at") functions.
+# Injects canary guard at function entry and checks before each return.
+# Detects code modification/tampering at runtime.
+#
+# Expected stderr:
+#   [ArmorComp][AT] integrity check injected: protected_func
+#   [ArmorComp][AT] integrity check injected: critical_section
+#
+# Expected output (when run on device/emulator):
+#   result = 42
+#   secret = 0x...
+#   ALL TESTS PASSED
+add_custom_target(test-at
+  COMMAND ${BREW_CLANG}
+    -target aarch64-linux-android21
+    --sysroot=${NDK_SYSROOT}
+    -resource-dir=${NDK_RESOURCE_DIR}
+    -fpass-plugin=$<TARGET_FILE:ArmorComp>
+    -O0
+    ${CMAKE_SOURCE_DIR}/test/at_test.c
+    -o ${CMAKE_BINARY_DIR}/at_test_aarch64
+  DEPENDS ArmorComp
+  COMMENT "Compiling test/at_test.c with AntiTamper pass → ARM64 Android ELF"
+)
+
+# ---- Test target: ControlFlowRandomizationPass (CFR) validation --
+# CFR auto-runs for annotate("cfr") functions.
+# Randomizes basic block layout order using deterministic PRNG.
+# Defeats static CFG reconstruction in IDA/Ghidra.
+#
+# Expected stderr:
+#   [ArmorComp][CFR] randomized layout: classify (N BBs)
+#   [ArmorComp][CFR] randomized layout: complex_logic (N BBs)
+#
+# Expected output (when run on device/emulator):
+#   classify(5) = 1
+#   compute(10) = 295
+#   ALL TESTS PASSED
+add_custom_target(test-cfr
+  COMMAND ${BREW_CLANG}
+    -target aarch64-linux-android21
+    --sysroot=${NDK_SYSROOT}
+    -resource-dir=${NDK_RESOURCE_DIR}
+    -fpass-plugin=$<TARGET_FILE:ArmorComp>
+    -O0
+    ${CMAKE_SOURCE_DIR}/test/cfr_test.c
+    -o ${CMAKE_BINARY_DIR}/cfr_test_aarch64
+  DEPENDS ArmorComp
+  COMMENT "Compiling test/cfr_test.c with ControlFlowRandomization pass → ARM64 Android ELF"
 )
 
 # ---- Test target: FakeAPICallPass (FAPI) validation ----

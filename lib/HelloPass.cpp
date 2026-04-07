@@ -143,6 +143,11 @@
 #include "ArmorComp/StrEncPass.h"
 #include "ArmorComp/SubPass.h"
 
+// P0/P1/P2 新增 Pass (反调试 / 防篡改 / 控制流随机化)
+#include "ArmorComp/AntiDebugPass.h"
+#include "ArmorComp/AntiTamperPass.h"
+#include "ArmorComp/ControlFlowRandomizationPass.h"
+
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
@@ -407,6 +412,17 @@ llvmGetPassPluginInfo() {
           //    runtime SP tracker, this defeats IDA's DWARF table reader that
           //    checks the .eh_frame CFA records.
           MPM.addPass(createModuleToFunctionPassAdaptor(DwarfPoisonPass(/*annotateOnly=*/true)));
+
+          // ── P1/P2 新增 Pass (运行时保护 + 布局混淆) ──────────────────────
+          // ADB: annotate("adb") — 反调试检测 (ptrace/clock/env)
+          MPM.addPass(createModuleToFunctionPassAdaptor(AntiDebugPass(/*annotateOnly=*/true)));
+          // AT: annotate("at") — 防篡改完整性校验 (canary guard)
+          MPM.addPass(createModuleToFunctionPassAdaptor(AntiTamperPass(/*annotateOnly=*/true)));
+          // CFR: annotate("cfr") — 控制流随机布局
+          MPM.addPass(createModuleToFunctionPassAdaptor(
+              ControlFlowRandomizationPass(/*annotateOnly=*/true,
+                                           /*splitBlocks=*/false,
+                                           /*fakeEntries=*/false)));
         }
       );
 
@@ -828,6 +844,46 @@ llvmGetPassPluginInfo() {
           // armorcomp-vmp-all — VMP (all functions)
           if (Name == "armorcomp-vmp-all") {
             FPM.addPass(VMPPass(/*annotateOnly=*/false));
+            return true;
+          }
+
+          // armorcomp-adb — anti-debug detection (annotation mode)
+          if (Name == "armorcomp-adb") {
+            FPM.addPass(AntiDebugPass(/*annotateOnly=*/true));
+            return true;
+          }
+          if (Name == "armorcomp-adb-all") {
+            FPM.addPass(AntiDebugPass(/*annotateOnly=*/false));
+            return true;
+          }
+
+          // armorcomp-at — anti-tamper integrity check (annotation mode)
+          if (Name == "armorcomp-at") {
+            FPM.addPass(AntiTamperPass(/*annotateOnly=*/true));
+            return true;
+          }
+          if (Name == "armorcomp-at-all") {
+            FPM.addPass(AntiTamperPass(/*annotateOnly=*/false));
+            return true;
+          }
+
+          // armorcomp-cfr — control flow randomization (annotation mode)
+          if (Name == "armorcomp-cfr") {
+            FPM.addPass(ControlFlowRandomizationPass(/*annotateOnly=*/true,
+                                                     /*splitBlocks=*/false,
+                                                     /*fakeEntries=*/false));
+            return true;
+          }
+          if (Name == "armorcomp-cfr-all") {
+            FPM.addPass(ControlFlowRandomizationPass(/*annotateOnly=*/false,
+                                                     /*splitBlocks=*/false,
+                                                     /*fakeEntries=*/false));
+            return true;
+          }
+          if (Name == "armorcomp-cfr-aggressive") {
+            FPM.addPass(ControlFlowRandomizationPass(/*annotateOnly=*/false,
+                                                     /*splitBlocks=*/true,
+                                                     /*fakeEntries=*/true));
             return true;
           }
 

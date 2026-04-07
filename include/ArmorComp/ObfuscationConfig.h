@@ -1,41 +1,24 @@
+#pragma once
 //===----------------------------------------------------------------------===//
 // ArmorComp — ObfuscationConfig
 //
-// YAML-based per-function pass selection (no source annotations required).
+// YAML-driven per-function pass selection.
 //
-// Activation (with clang -fpass-plugin):
-//   ARMORCOMP_CONFIG=/path/to/armorcomp.yaml \
-//     clang -fpass-plugin=ArmorComp.dylib source.c -o output
-//
-// Note: clang loads pass plugins AFTER command-line parsing, so -mllvm flags
-// cannot be used to pass the config path.  Use the ARMORCOMP_CONFIG env var
-// instead.  When using `opt` directly, -armorcomp-config=<path> also works.
-//
-// Config format (YAML):
-// ──────────────────────
+// Config format (armorcomp.yaml):
 //   functions:
-//     - name: "verify_license"          # exact function name
-//       passes: [cff, bcf, sub, mba, icall, ibr, igv]
-//
-//     - pattern: "^Java_"               # POSIX ERE, matches any function name
+//     - name: "exact_fn_name"       # exact match
+//       passes: [cff, bcf, sub, mba]
+//     - pattern: "^Java_"           # POSIX ERE regex
 //       passes: [cff, bcf, icall, ibr]
 //
-//     - pattern: "^secure_"
-//       passes: [strenc, split, sub, cff]
+// Activation (in priority order):
+//   1. cl::opt  --armorcomp-config=<path>   (works with `opt`, not clang)
+//   2. Env var  ARMORCOMP_CONFIG=<path>
+//   3. Auto-discovery: armorcomp.yaml in CWD
 //
-// Pass names (same as annotation strings):
-//   cff, bcf, sub, mba, split, strenc, icall, ibr, igv
-//
-// Semantics:
-//   - Config rules are evaluated top-to-bottom; first matching rule wins.
-//   - Config is additive with __attribute__((annotate(...))):
-//     a function is transformed if EITHER the annotation OR a config rule
-//     says to apply the pass.
-//   - If no config file is specified, all behaviour is annotation-driven
-//     (backward-compatible).
+// All passes call armorcomp::configSaysApply(fnName, passName) to check
+// whether the config file enables a given pass for a given function.
 //===----------------------------------------------------------------------===//
-
-#pragma once
 
 #include "llvm/ADT/StringRef.h"
 
@@ -44,50 +27,28 @@
 
 namespace armorcomp {
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Data structures
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// One entry in the config `functions:` list.
+/// One rule entry in the YAML config.
 struct FunctionRule {
-  /// Exact function name to match (mutually exclusive with pattern).
-  std::string name;
-
-  /// POSIX ERE pattern matched against the function name (mutually exclusive
-  /// with name).  An anchored pattern like "^Java_" is recommended.
-  std::string pattern;
-
-  /// Pass names to apply when this rule matches.
-  /// Valid values: cff, bcf, sub, mba, split, strenc, icall, ibr, igv
-  std::vector<std::string> passes;
+  std::string name;                  ///< Exact function name (or empty)
+  std::string pattern;               ///< POSIX ERE regex (or empty)
+  std::vector<std::string> passes;   ///< Pass names to apply
 };
 
-/// Parsed representation of armorcomp.yaml.
+/// Parsed representation of the YAML config file.
 struct ObfuscationConfig {
   std::vector<FunctionRule> rules;
 
-  /// Returns true if any rule matches `fnName` and lists `passName`.
-  /// Rules are evaluated top-to-bottom; the first matching rule is used.
-  bool shouldApplyPass(llvm::StringRef fnName,
-                       llvm::StringRef passName) const;
-
-  bool empty() const { return rules.empty(); }
+  /// Returns true if passName should be applied to fnName according to the
+  /// loaded rules.  First matching rule wins; if no rule matches returns false.
+  bool shouldApplyPass(llvm::StringRef fnName, llvm::StringRef passName) const;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Global config accessor (loaded lazily from -armorcomp-config=<path>)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Returns a pointer to the process-wide ObfuscationConfig, or nullptr if
-/// no config file was specified or parsing failed.
-///
-/// Thread-safety: this function is NOT thread-safe.  LLVM pass pipelines are
-/// single-threaded by default, so this is fine for normal use.
+/// Returns the global config singleton (loaded once from file).
+/// Returns nullptr if no config file was found or parsing failed.
 const ObfuscationConfig *getGlobalObfuscationConfig();
 
-/// Helper: returns true if the global config says to apply `passName` to `fn`.
-/// Returns false (not "true") when no config is loaded — callers still fall
-/// back to annotation-driven selection.
+/// Convenience wrapper: returns true if the config says to apply passName
+/// to fnName.  Returns false if no config is loaded.
 bool configSaysApply(llvm::StringRef fnName, llvm::StringRef passName);
 
 } // namespace armorcomp

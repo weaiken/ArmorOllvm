@@ -84,20 +84,20 @@ static bool hasBCFAnnotation(Function &F) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void demoteForBCF(Function &F) {
-  // 1. Demote PHI nodes
-  bool changed = true;
-  while (changed) {
-    changed = false;
+  // 1. Demote PHI nodes — O(n) 一次性收集 + 批量处理 (优化后)
+  //    原实现使用 while 循环逐个处理，复杂度 O(n × m)
+  //    现改为一次性收集所有 PHI 再批量 demote，复杂度 O(n)
+  {
+    std::vector<PHINode *> phis;
     for (auto &BB : F)
       for (auto &I : BB)
-        if (auto *phi = dyn_cast<PHINode>(&I)) {
-          DemotePHIToStack(phi);
-          changed = true;
-          break;
-        } else {
-          break;
-        }
-    if (changed) continue; // restart outer loop
+        if (auto *phi = dyn_cast<PHINode>(&I))
+          phis.push_back(phi);
+        else
+          break; // PHIs are always at the top of a BB
+
+    for (auto *phi : phis)
+      DemotePHIToStack(phi);
   }
 
   // 2. Demote cross-block SSA values
