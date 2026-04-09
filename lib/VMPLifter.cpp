@@ -9,9 +9,11 @@
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
@@ -38,14 +40,30 @@ void VMPLifter::reset() {
   nextVReg = 0;
   virtInstrCount = 0;
   junkRng = 0;
+  // Dead register reclamation state
+  lastUseOrder.clear();
+  freeRegs.clear();
+  regToValue.clear();
+  currentInstrIdx = 0;
+  regExhausted = false;
+  cmpxchgRegs.clear();
 }
 
 uint8_t VMPLifter::allocVReg(Value *V) {
   auto it = vregMap.find(V);
   if (it != vregMap.end()) return it->second;
-  assert(nextVReg < NUM_REGS && "VMP: ran out of virtual registers");
-  uint8_t r = nextVReg++;
+  uint8_t r;
+  if (!freeRegs.empty()) {
+    r = freeRegs.back();
+    freeRegs.pop_back();
+  } else if (nextVReg < NUM_REGS) {
+    r = nextVReg++;
+  } else {
+    regExhausted = true;
+    return UINT8_MAX;
+  }
   vregMap[V] = r;
+  regToValue[r] = V;
   return r;
 }
 
@@ -68,7 +86,110 @@ uint8_t VMPLifter::getBitWidth(Type *T) const {
     return static_cast<uint8_t>(IT->getBitWidth());
   if (T->isPointerTy())
     return DLPtr ? static_cast<uint8_t>(DLPtr->getPointerSizeInBits()) : 64;
+  if (T->isFloatTy())  return 32;
+  if (T->isDoubleTy()) return 64;
   return 0;    // unsupported
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// allocScratchReg — allocate an anonymous scratch register (not in vregMap)
+// Caller MUST push_back to freeRegs when the scratch is no longer needed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+uint8_t VMPLifter::allocScratchReg() {
+  if (!freeRegs.empty()) {
+    uint8_t r = freeRegs.back();
+    freeRegs.pop_back();
+    return r;
+  }
+  if (nextVReg < NUM_REGS) {
+    return nextVReg++;
+  }
+  regExhausted = true;
+  return UINT8_MAX;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// computeLastUses — pre-scan in RPO to compute each Value's last-use index
+// PHI incoming values are conservatively set to UINT_MAX (never reclaimed).
+// ─────────────────────────────────────────────────────────────────────────────
+
+void VMPLifter::computeLastUses(Function &F) {
+  lastUseOrder.clear();
+  unsigned idx = 0;
+
+  ReversePostOrderTraversal<Function *> RPOT(&F);
+  for (BasicBlock *BB : RPOT) {
+    for (auto &I : *BB) {
+      if (isa<PHINode>(&I)) continue; // PHIs handled separately
+
+      // For each operand used by this instruction, record idx as its last use.
+      // IMPORTANT: cross-BB values must NEVER be reclaimed — in a loop the
+      // same bytecode re-executes, but the register may have been recycled for
+      // a different value.  Only intra-BB temporaries are safe to recycle
+      // because the define always precedes the use within the same BB.
+      for (unsigned op = 0, e = I.getNumOperands(); op < e; ++op) {
+        Value *V = I.getOperand(op);
+        if (isa<BasicBlock>(V) || isa<Constant>(V)) continue;
+
+        // If V is an Instruction defined in a different BB → cross-BB → never reclaim
+        if (auto *DefI = dyn_cast<Instruction>(V)) {
+          if (DefI->getParent() != BB) {
+            lastUseOrder[V] = UINT_MAX;
+            continue;
+          }
+        }
+
+        // If V is a function Argument, it's cross-BB by nature.
+        // (Arguments are also guarded by REG_ARG_LAST in reclaimDeadRegs,
+        //  but belt-and-suspenders.)
+        if (isa<Argument>(V)) {
+          lastUseOrder[V] = UINT_MAX;
+          continue;
+        }
+
+        lastUseOrder[V] = idx; // overwrites → keeps the latest
+      }
+      ++idx;
+    }
+  }
+
+  // PHI incoming values: set to UINT_MAX so they are never reclaimed
+  for (BasicBlock *BB : RPOT) {
+    for (auto &I : *BB) {
+      auto *PN = dyn_cast<PHINode>(&I);
+      if (!PN) break;
+      lastUseOrder[PN] = UINT_MAX; // PHI dest: never reclaim
+      for (unsigned i = 0, e = PN->getNumIncomingValues(); i < e; ++i) {
+        Value *inVal = PN->getIncomingValue(i);
+        if (!isa<Constant>(inVal))
+          lastUseOrder[inVal] = UINT_MAX; // PHI operand: never reclaim
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reclaimDeadRegs — recycle registers whose Value's last use has passed
+// Skips R0–R7 (argument registers are never reclaimable).
+// ─────────────────────────────────────────────────────────────────────────────
+
+void VMPLifter::reclaimDeadRegs() {
+  // Collect dead entries (can't erase while iterating)
+  SmallVector<uint8_t, 8> dead;
+  for (auto &[reg, val] : regToValue) {
+    if (reg <= REG_ARG_LAST) continue; // never reclaim argument regs
+    auto it = lastUseOrder.find(val);
+    if (it != lastUseOrder.end() && it->second < currentInstrIdx) {
+      dead.push_back(reg);
+    }
+  }
+  for (uint8_t r : dead) {
+    Value *V = regToValue[r];
+    vregMap.erase(V);
+    regToValue.erase(r);
+    freeRegs.push_back(r);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -92,13 +213,21 @@ uint8_t VMPLifter::materialise(std::vector<uint8_t> &bc, Value *V) {
   if (auto *CI = dyn_cast<ConstantInt>(V)) {
     uint64_t imm64 = CI->getZExtValue();
     uint8_t r = allocVReg(V);
+    if (r == UINT8_MAX) return UINT8_MAX;
     xorshift64step(junkRng);
-    bool useNOT = (imm64 != 0) && (junkRng & 1) && (nextVReg < NUM_REGS - 1);
+    bool useNOT = (imm64 != 0) && (junkRng & 1);
     if (useNOT) {
-      uint8_t tmp = nextVReg++; // anonymous scratch register (not in vregMap)
+      uint8_t tmp = allocScratchReg();
+      if (tmp == UINT8_MAX) {
+        // Fall back to plain MOV
+        emitMOV_IMM(bc, r, imm64);
+        ++virtInstrCount;
+        return r;
+      }
       emitMOV_IMM(bc, tmp, ~imm64);
       emit2R(bc, NOT, r, tmp);
       virtInstrCount += 2;
+      freeRegs.push_back(tmp); // scratch lifetime ends here
     } else {
       emitMOV_IMM(bc, r, imm64);
       ++virtInstrCount;
@@ -106,9 +235,21 @@ uint8_t VMPLifter::materialise(std::vector<uint8_t> &bc, Value *V) {
     return r;
   }
 
+  // ConstantFP: store IEEE 754 bit pattern as i64.
+  // Float → 32-bit pattern zero-extended; double → 64-bit pattern.
+  if (auto *CFP = dyn_cast<ConstantFP>(V)) {
+    uint64_t bits = CFP->getValueAPF().bitcastToAPInt().getZExtValue();
+    uint8_t r = allocVReg(V);
+    if (r == UINT8_MAX) return UINT8_MAX;
+    emitMOV_IMM(bc, r, bits);
+    ++virtInstrCount;
+    return r;
+  }
+
   // ConstantPointerNull: treat as 0
   if (isa<ConstantPointerNull>(V)) {
     uint8_t r = allocVReg(V);
+    if (r == UINT8_MAX) return UINT8_MAX;
     emitMOV_I8(bc, r, 0);
     ++virtInstrCount;
     return r;
@@ -117,6 +258,7 @@ uint8_t VMPLifter::materialise(std::vector<uint8_t> &bc, Value *V) {
   // UndefValue / PoisonValue: materialise as 0 (safe no-op for our purposes)
   if (isa<UndefValue>(V) || isa<PoisonValue>(V)) {
     uint8_t r = allocVReg(V);
+    if (r == UINT8_MAX) return UINT8_MAX;
     emitMOV_I8(bc, r, 0);
     ++virtInstrCount;
     return r;
@@ -126,6 +268,7 @@ uint8_t VMPLifter::materialise(std::vector<uint8_t> &bc, Value *V) {
   if (auto *GV = dyn_cast<GlobalValue>(V)) {
     uint16_t idx = lookupGV(GV);
     uint8_t dst = allocVReg(V);
+    if (dst == UINT8_MAX) return UINT8_MAX;
     emitMOV_GV(bc, dst, idx);
     ++virtInstrCount;
     return dst;
@@ -154,16 +297,21 @@ uint8_t VMPLifter::materialise(std::vector<uint8_t> &bc, Value *V) {
       if (!baseGV) return UINT8_MAX;
       uint16_t gvIdx = lookupGV(baseGV);
       uint8_t dst = allocVReg(V);
+      if (dst == UINT8_MAX) return UINT8_MAX;
       if (byteOffset.isZero()) {
         emitMOV_GV(bc, dst, gvIdx);
         ++virtInstrCount;
       } else {
-        uint8_t baseReg = nextVReg++; assert(baseReg < NUM_REGS);
-        uint8_t offReg  = nextVReg++; assert(offReg < NUM_REGS);
+        uint8_t baseReg = allocScratchReg();
+        if (baseReg == UINT8_MAX) return UINT8_MAX;
+        uint8_t offReg = allocScratchReg();
+        if (offReg == UINT8_MAX) { freeRegs.push_back(baseReg); return UINT8_MAX; }
         emitMOV_GV(bc, baseReg, gvIdx);
         emitMOV_IMM(bc, offReg, byteOffset.getZExtValue());
         emitGEP8(bc, dst, baseReg, offReg);
         virtInstrCount += 3;
+        freeRegs.push_back(baseReg);
+        freeRegs.push_back(offReg);
       }
       return dst;
     }
@@ -449,6 +597,95 @@ void VMPLifter::emitBranch(std::vector<uint8_t> &bc, BranchInst &BI,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// emitSwitch — lower SwitchInst to cascading ICmp_EQ + JCC, then JMP default
+//
+// For each case (C_i, BB_i):
+//   R_cmp = ICmp_EQ(condReg, C_i)
+//   JCC R_cmp, BB_i (or trampoline), 0 (fallthrough)
+// After all cases:
+//   JMP defaultBB
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool VMPLifter::emitSwitch(std::vector<uint8_t> &bc, SwitchInst &SI,
+                           BasicBlock *curBB) {
+  uint8_t condReg = materialise(bc, SI.getCondition());
+  if (condReg == UINT8_MAX) return false;
+
+  BasicBlock *defaultBB = SI.getDefaultDest();
+
+  // Emit cascading ICmp_EQ + JCC for each case value
+  for (auto caseIt : SI.cases()) {
+    ConstantInt *caseVal = caseIt.getCaseValue();
+    BasicBlock  *caseBB  = caseIt.getCaseSuccessor();
+
+    uint8_t caseReg = materialise(bc, caseVal);
+    if (caseReg == UINT8_MAX) return false;
+
+    uint8_t cmpReg = allocScratchReg();
+    if (cmpReg == UINT8_MAX) return false;
+    emit3R(bc, ICMP_EQ, cmpReg, condReg, caseReg);
+    ++virtInstrCount;
+
+    // JCC: cmpReg, trueOffset, falseOffset(=0 for fallthrough)
+    uint32_t jccStart  = static_cast<uint32_t>(bc.size());
+    uint32_t instrEnd  = jccStart + 10; // JCC = 10 bytes
+    uint32_t patchTrue = jccStart + 2;
+    uint32_t patchFalse = jccStart + 6;
+    emitJCC(bc, cmpReg, 0, 0); // placeholders
+    ++virtInstrCount;
+    freeRegs.push_back(cmpReg); // reclaim scratch
+
+    // False edge: fallthrough = offset 0
+    patch32(bc, patchFalse, 0);
+
+    // True edge
+    bool needTramp = edgeHasPhiMovs(curBB, caseBB);
+    if (needTramp) {
+      // Trampoline: emit phi movs for this edge + JMP to caseBB
+      int32_t trampOff = static_cast<int32_t>(bc.size()) -
+                         static_cast<int32_t>(instrEnd);
+      patch32(bc, patchTrue, trampOff);
+      emitPhiMovsForEdge(bc, curBB, caseBB);
+      uint32_t jmpPatch = static_cast<uint32_t>(bc.size()) + 1;
+      uint32_t jmpEnd   = static_cast<uint32_t>(bc.size()) + 5;
+      emitJMP(bc, 0);
+      ++virtInstrCount;
+      auto it = bbOffset.find(caseBB);
+      if (it != bbOffset.end())
+        patch32(bc, jmpPatch,
+                static_cast<int32_t>(it->second) - static_cast<int32_t>(jmpEnd));
+      else
+        addFwdRef(jmpPatch, jmpEnd, caseBB);
+    } else {
+      auto it = bbOffset.find(caseBB);
+      if (it != bbOffset.end())
+        patch32(bc, patchTrue,
+                static_cast<int32_t>(it->second) - static_cast<int32_t>(instrEnd));
+      else
+        addFwdRef(patchTrue, instrEnd, caseBB);
+    }
+  }
+
+  // Default case: JMP to defaultBB
+  bool needDefTramp = edgeHasPhiMovs(curBB, defaultBB);
+  if (needDefTramp)
+    emitPhiMovsForEdge(bc, curBB, defaultBB);
+
+  uint32_t jmpPatch = static_cast<uint32_t>(bc.size()) + 1;
+  uint32_t jmpEnd   = static_cast<uint32_t>(bc.size()) + 5;
+  emitJMP(bc, 0);
+  ++virtInstrCount;
+  auto it = bbOffset.find(defaultBB);
+  if (it != bbOffset.end())
+    patch32(bc, jmpPatch,
+            static_cast<int32_t>(it->second) - static_cast<int32_t>(jmpEnd));
+  else
+    addFwdRef(jmpPatch, jmpEnd, defaultBB);
+
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // emitInstr — emit a single non-PHI instruction
 // Returns false if the instruction cannot be handled.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -456,11 +693,34 @@ void VMPLifter::emitBranch(std::vector<uint8_t> &bc, BranchInst &BI,
 bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
   // ── BinaryOperator ────────────────────────────────────────────────────────
   if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+    // Super-instruction optimisation: ADD/SUB with a constant i32 operand
+    // → fused ADD_I32 / SUB_I32 (saves one MOV + one dispatch cycle).
+    if ((BO->getOpcode() == Instruction::Add ||
+         BO->getOpcode() == Instruction::Sub) &&
+        !BO->getType()->isFloatingPointTy()) {
+      if (auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+        int64_t val = CI->getSExtValue();
+        if (val >= INT32_MIN && val <= INT32_MAX) {
+          uint8_t lhs = materialise(bc, BO->getOperand(0));
+          if (lhs == UINT8_MAX) return false;
+          uint8_t dst = allocVReg(BO);
+          if (dst == UINT8_MAX) return false;
+          Opcode superOp = (BO->getOpcode() == Instruction::Add)
+                               ? ADD_I32 : SUB_I32;
+          emit8(bc, superOp); emit8(bc, dst); emit8(bc, lhs);
+          emit32(bc, static_cast<uint32_t>(val));
+          ++virtInstrCount;
+          return true;
+        }
+      }
+    }
+
     uint8_t lhs = materialise(bc, BO->getOperand(0));
     uint8_t rhs = materialise(bc, BO->getOperand(1));
     if (lhs == UINT8_MAX || rhs == UINT8_MAX) return false;
 
     uint8_t dst = allocVReg(BO);
+    if (dst == UINT8_MAX) return false;
     Opcode op;
     switch (BO->getOpcode()) {
       case Instruction::Add:  op = ADD;  break;
@@ -476,9 +736,35 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
       case Instruction::Shl:  op = SHL;  break;
       case Instruction::LShr: op = LSHR; break;
       case Instruction::AShr: op = ASHR; break;
+      case Instruction::FAdd: op = FADD; break;
+      case Instruction::FSub: op = FSUB; break;
+      case Instruction::FMul: op = FMUL; break;
+      case Instruction::FDiv: op = FDIV; break;
+      case Instruction::FRem: op = FREM; break;
       default: return false;
     }
-    emit3R(bc, op, dst, lhs, rhs);
+    bool isFP = BO->getType()->isFloatingPointTy();
+    if (isFP) {
+      uint8_t fpW = getBitWidth(BO->getType());
+      if (fpW == 0) return false;
+      emit3R_W(bc, op, dst, lhs, rhs, fpW);
+    } else {
+      emit3R(bc, op, dst, lhs, rhs);
+    }
+    ++virtInstrCount;
+    return true;
+  }
+
+  // ── UnaryOperator (fneg) ──────────────────────────────────────────────────
+  if (auto *UO = dyn_cast<UnaryOperator>(&I)) {
+    if (UO->getOpcode() != Instruction::FNeg) return false;
+    uint8_t src = materialise(bc, UO->getOperand(0));
+    if (src == UINT8_MAX) return false;
+    uint8_t dst = allocVReg(UO);
+    if (dst == UINT8_MAX) return false;
+    uint8_t fpW = getBitWidth(UO->getType());
+    if (fpW == 0) return false;
+    emit2R_W(bc, FNEG, dst, src, fpW);
     ++virtInstrCount;
     return true;
   }
@@ -500,20 +786,24 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     if (isSigned) {
       uint8_t w = getBitWidth(IC->getOperand(0)->getType());
       if (w > 0 && w < 64) {
-        uint8_t sl = nextVReg++;
-        if (sl >= NUM_REGS) return false;
+        uint8_t sl = allocScratchReg();
+        if (sl == UINT8_MAX) return false;
         emitSEXT(bc, sl, lhs, w);
         lhs = sl;
         ++virtInstrCount;
-        uint8_t sr = nextVReg++;
-        if (sr >= NUM_REGS) return false;
+        uint8_t sr = allocScratchReg();
+        if (sr == UINT8_MAX) { freeRegs.push_back(sl); return false; }
         emitSEXT(bc, sr, rhs, w);
         rhs = sr;
         ++virtInstrCount;
+        // scratch regs consumed by ICMP dst below — reclaim after emit
+        freeRegs.push_back(sl);
+        freeRegs.push_back(sr);
       }
     }
 
     uint8_t dst = allocVReg(IC);
+    if (dst == UINT8_MAX) return false;
     Opcode op;
     switch (IC->getPredicate()) {
       case ICmpInst::ICMP_EQ:  op = ICMP_EQ;  break;
@@ -533,6 +823,40 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     return true;
   }
 
+  // ── FCmpInst (6 ordered predicates) ─────────────────────────────────────
+  if (auto *FC = dyn_cast<FCmpInst>(&I)) {
+    uint8_t lhs = materialise(bc, FC->getOperand(0));
+    uint8_t rhs = materialise(bc, FC->getOperand(1));
+    if (lhs == UINT8_MAX || rhs == UINT8_MAX) return false;
+
+    uint8_t fpW = getBitWidth(FC->getOperand(0)->getType());
+    if (fpW == 0) return false;
+
+    uint8_t dst = allocVReg(FC);
+    if (dst == UINT8_MAX) return false;
+    Opcode op;
+    switch (FC->getPredicate()) {
+      case FCmpInst::FCMP_OEQ: op = FCMP_OEQ; break;
+      case FCmpInst::FCMP_ONE: op = FCMP_ONE; break;
+      case FCmpInst::FCMP_OLT: op = FCMP_OLT; break;
+      case FCmpInst::FCMP_OLE: op = FCMP_OLE; break;
+      case FCmpInst::FCMP_OGT: op = FCMP_OGT; break;
+      case FCmpInst::FCMP_OGE: op = FCMP_OGE; break;
+      case FCmpInst::FCMP_UEQ: op = FCMP_UEQ; break;
+      case FCmpInst::FCMP_UNE: op = FCMP_UNE; break;
+      case FCmpInst::FCMP_ULT: op = FCMP_ULT; break;
+      case FCmpInst::FCMP_ULE: op = FCMP_ULE; break;
+      case FCmpInst::FCMP_UGT: op = FCMP_UGT; break;
+      case FCmpInst::FCMP_UGE: op = FCMP_UGE; break;
+      case FCmpInst::FCMP_ORD: op = FCMP_ORD; break;
+      case FCmpInst::FCMP_UNO: op = FCMP_UNO; break;
+      default: return false;  // FCMP_FALSE/FCMP_TRUE — trivial, unsupported
+    }
+    emit3R_W(bc, op, dst, lhs, rhs, fpW);
+    ++virtInstrCount;
+    return true;
+  }
+
   // ── ZExtInst ─────────────────────────────────────────────────────────────
   if (auto *ZE = dyn_cast<ZExtInst>(&I)) {
     uint8_t src = materialise(bc, ZE->getOperand(0));
@@ -540,6 +864,7 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     uint8_t w = getBitWidth(ZE->getSrcTy());
     if (w == 0) return false;
     uint8_t dst = allocVReg(ZE);
+    if (dst == UINT8_MAX) return false;
     emitZEXT(bc, dst, src, w);
     ++virtInstrCount;
     return true;
@@ -552,6 +877,7 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     uint8_t w = getBitWidth(SE->getSrcTy());
     if (w == 0) return false;
     uint8_t dst = allocVReg(SE);
+    if (dst == UINT8_MAX) return false;
     emitSEXT(bc, dst, src, w);
     ++virtInstrCount;
     return true;
@@ -564,6 +890,7 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     uint8_t w = getBitWidth(TR->getDestTy());
     if (w == 0) return false;
     uint8_t dst = allocVReg(TR);
+    if (dst == UINT8_MAX) return false;
     emitTRUNC(bc, dst, src, w);
     ++virtInstrCount;
     return true;
@@ -574,6 +901,7 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     uint8_t src = materialise(bc, PI->getOperand(0));
     if (src == UINT8_MAX) return false;
     uint8_t dst = allocVReg(PI);
+    if (dst == UINT8_MAX) return false;
     emit2R(bc, PTRTOINT, dst, src);
     ++virtInstrCount;
     return true;
@@ -584,7 +912,92 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     uint8_t src = materialise(bc, IP->getOperand(0));
     if (src == UINT8_MAX) return false;
     uint8_t dst = allocVReg(IP);
+    if (dst == UINT8_MAX) return false;
     emit2R(bc, INTTOPTR, dst, src);
+    ++virtInstrCount;
+    return true;
+  }
+
+  // ── FPExtInst (float → double) ────────────────────────────────────────────
+  if (auto *FE = dyn_cast<FPExtInst>(&I)) {
+    uint8_t src = materialise(bc, FE->getOperand(0));
+    if (src == UINT8_MAX) return false;
+    uint8_t dst = allocVReg(FE);
+    if (dst == UINT8_MAX) return false;
+    emit2R(bc, FPEXT, dst, src);
+    ++virtInstrCount;
+    return true;
+  }
+
+  // ── FPTruncInst (double → float) ────────────────────────────────────────
+  if (auto *FT = dyn_cast<FPTruncInst>(&I)) {
+    uint8_t src = materialise(bc, FT->getOperand(0));
+    if (src == UINT8_MAX) return false;
+    uint8_t dst = allocVReg(FT);
+    if (dst == UINT8_MAX) return false;
+    emit2R(bc, FPTRUNC, dst, src);
+    ++virtInstrCount;
+    return true;
+  }
+
+  // ── FPToSIInst (float/double → signed i64) ──────────────────────────────
+  if (auto *FI = dyn_cast<FPToSIInst>(&I)) {
+    uint8_t src = materialise(bc, FI->getOperand(0));
+    if (src == UINT8_MAX) return false;
+    uint8_t dst = allocVReg(FI);
+    if (dst == UINT8_MAX) return false;
+    uint8_t fpW = getBitWidth(FI->getSrcTy());
+    if (fpW == 0) return false;
+    emit2R_W(bc, FPTOSI, dst, src, fpW);
+    ++virtInstrCount;
+    return true;
+  }
+
+  // ── FPToUIInst (float/double → unsigned i64) ────────────────────────────
+  if (auto *FU = dyn_cast<FPToUIInst>(&I)) {
+    uint8_t src = materialise(bc, FU->getOperand(0));
+    if (src == UINT8_MAX) return false;
+    uint8_t dst = allocVReg(FU);
+    if (dst == UINT8_MAX) return false;
+    uint8_t fpW = getBitWidth(FU->getSrcTy());
+    if (fpW == 0) return false;
+    emit2R_W(bc, FPTOUI, dst, src, fpW);
+    ++virtInstrCount;
+    return true;
+  }
+
+  // ── SIToFPInst (signed int → float/double) ──────────────────────────────
+  if (auto *SF = dyn_cast<SIToFPInst>(&I)) {
+    uint8_t src = materialise(bc, SF->getOperand(0));
+    if (src == UINT8_MAX) return false;
+    // Sign-extend sub-64-bit source so sitofp i64 sees correct sign
+    uint8_t srcIntW = getBitWidth(SF->getSrcTy());
+    if (srcIntW > 0 && srcIntW < 64) {
+      uint8_t sextReg = allocScratchReg();
+      if (sextReg == UINT8_MAX) return false;
+      emitSEXT(bc, sextReg, src, srcIntW);
+      src = sextReg;
+      ++virtInstrCount;
+      freeRegs.push_back(sextReg); // scratch consumed by SITOFP below
+    }
+    uint8_t dst = allocVReg(SF);
+    if (dst == UINT8_MAX) return false;
+    uint8_t fpW = getBitWidth(SF->getDestTy());
+    if (fpW == 0) return false;
+    emit2R_W(bc, SITOFP, dst, src, fpW);
+    ++virtInstrCount;
+    return true;
+  }
+
+  // ── UIToFPInst (unsigned int → float/double) ────────────────────────────
+  if (auto *UF = dyn_cast<UIToFPInst>(&I)) {
+    uint8_t src = materialise(bc, UF->getOperand(0));
+    if (src == UINT8_MAX) return false;
+    uint8_t dst = allocVReg(UF);
+    if (dst == UINT8_MAX) return false;
+    uint8_t fpW = getBitWidth(UF->getDestTy());
+    if (fpW == 0) return false;
+    emit2R_W(bc, UITOFP, dst, src, fpW);
     ++virtInstrCount;
     return true;
   }
@@ -594,6 +1007,7 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     uint8_t src = materialise(bc, BC->getOperand(0));
     if (src == UINT8_MAX) return false;
     uint8_t dst = allocVReg(BC);
+    if (dst == UINT8_MAX) return false;
     emitMOV_RR(bc, dst, src);
     ++virtInstrCount;
     return true;
@@ -607,6 +1021,7 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     if (cond == UINT8_MAX || rTrue == UINT8_MAX || rFalse == UINT8_MAX)
       return false;
     uint8_t dst = allocVReg(SI);
+    if (dst == UINT8_MAX) return false;
     emitSELECT(bc, dst, cond, rTrue, rFalse);
     ++virtInstrCount;
     return true;
@@ -625,6 +1040,7 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     uint64_t totalSz = sz * count;
     if (totalSz > UINT32_MAX) return false;
     uint8_t dst = allocVReg(AI);
+    if (dst == UINT8_MAX) return false;
     emitALLOCA(bc, dst, static_cast<uint32_t>(totalSz));
     ++virtInstrCount;
     return true;
@@ -638,6 +1054,7 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     uint8_t w = getBitWidth(LI->getType());
     if (w == 0) return false;
     uint8_t dst = allocVReg(LI);
+    if (dst == UINT8_MAX) return false;
     emitLOAD(bc, w, dst, ptr);
     ++virtInstrCount;
     return true;
@@ -662,6 +1079,7 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     uint8_t base = materialise(bc, GEP->getPointerOperand());
     if (base == UINT8_MAX) return false;
     uint8_t dst = allocVReg(GEP);
+    if (dst == UINT8_MAX) return false;
 
     // Multi-level constant GEP (e.g. struct field: gep %S, 0, field_idx).
     // accumulateConstantOffset collapses all indices into a single byte
@@ -669,11 +1087,12 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     if (GEP->getNumIndices() > 1 && GEP->hasAllConstantIndices()) {
       APInt byteOff(64, 0);
       if (GEP->accumulateConstantOffset(DL, byteOff)) {
-        uint8_t offReg = nextVReg++;
-        assert(offReg < NUM_REGS);
+        uint8_t offReg = allocScratchReg();
+        if (offReg == UINT8_MAX) return false;
         emitMOV_IMM(bc, offReg, byteOff.getZExtValue());
         emitGEP8(bc, dst, base, offReg);
         virtInstrCount += 2; // MOV_IMM + GEP8
+        freeRegs.push_back(offReg);
         return true;
       }
       // Fall through to single-index path only if accumulate fails
@@ -694,14 +1113,16 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
       emitGEP8(bc, dst, base, idx);
     } else {
       // Multiply index by element size, then add to base.
-      uint8_t szReg = nextVReg++;
-      assert(szReg < NUM_REGS);
+      uint8_t szReg = allocScratchReg();
+      if (szReg == UINT8_MAX) return false;
       emitMOV_IMM(bc, szReg, elemSz);
-      uint8_t byteIdxReg = nextVReg++;
-      assert(byteIdxReg < NUM_REGS);
+      uint8_t byteIdxReg = allocScratchReg();
+      if (byteIdxReg == UINT8_MAX) { freeRegs.push_back(szReg); return false; }
       emit3R(bc, MUL, byteIdxReg, idx, szReg);
       emitGEP8(bc, dst, base, byteIdxReg);
       virtInstrCount += 2;
+      freeRegs.push_back(szReg);
+      freeRegs.push_back(byteIdxReg);
     }
     ++virtInstrCount;
     return true;
@@ -743,6 +1164,7 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
 
       // Allocate a destination vreg even for void calls (value unused).
       uint8_t dst = allocVReg(CI);
+      if (dst == UINT8_MAX) return false;
       emitCALL(bc, dst, fnPtrReg, argRegs); // fixed-width: pads to MAX_CALL_ARGS
       ++virtInstrCount;
       return true;
@@ -752,18 +1174,67 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     if (callee->isIntrinsic())
       return handleIntrinsic(bc, *CI);
 
-    if (callee->isVarArg()) return false;
+    // ── VarArg call support ──────────────────────────────────────────────
+    // For each vararg call site, generate a non-vararg wrapper function
+    // with fixed parameter types matching the actual arguments at this
+    // call site, then route through the normal CALL_D path.
+    if (callee->isVarArg()) {
+      unsigned nva = CI->arg_size();
+      if (nva > MAX_CALL_ARGS) return false;
+      for (unsigned k = 0; k < nva; ++k) {
+        Type *t = CI->getArgOperand(k)->getType();
+        if (!t->isIntegerTy() && !t->isPointerTy() && !t->isFloatingPointTy())
+          return false;
+      }
+      Type *vaRetTy = CI->getType();
+      if (!vaRetTy->isVoidTy() && !vaRetTy->isIntegerTy()
+          && !vaRetTy->isPointerTy() && !vaRetTy->isFloatingPointTy())
+        return false;
+
+      // Build wrapper: fixed-arg signature matching this call site.
+      SmallVector<Type *, 8> wrapParamTys;
+      for (unsigned k = 0; k < nva; ++k)
+        wrapParamTys.push_back(CI->getArgOperand(k)->getType());
+      FunctionType *wrapTy =
+          FunctionType::get(vaRetTy, wrapParamTys, /*isVarArg=*/false);
+
+      static unsigned vaWrapCounter = 0;
+      std::string wrapName =
+          "__armorcomp_vmp_va_" + std::to_string(vaWrapCounter++);
+      Module *M = I.getParent()->getParent()->getParent();
+      Function *wrapper = Function::Create(
+          wrapTy, GlobalValue::InternalLinkage, wrapName, M);
+      wrapper->addFnAttr(Attribute::NoInline);
+
+      // Wrapper body: forward all args to original vararg callee.
+      BasicBlock *wBB =
+          BasicBlock::Create(M->getContext(), "entry", wrapper);
+      IRBuilder<> wB(wBB);
+      SmallVector<Value *, 8> fwdArgs;
+      for (auto &Arg : wrapper->args())
+        fwdArgs.push_back(&Arg);
+      Value *fwdRet =
+          wB.CreateCall(callee->getFunctionType(), callee, fwdArgs);
+      if (vaRetTy->isVoidTy())
+        wB.CreateRetVoid();
+      else
+        wB.CreateRet(fwdRet);
+
+      callee = wrapper; // fall through to normal CALL_D path
+    }
 
     unsigned nargs = CI->arg_size();
     if (nargs > MAX_CALL_ARGS) return false;
 
-    // Only integer / pointer arg types and return type.
+    // Supported arg/ret types: integer, pointer, float, double.
     for (unsigned k = 0; k < nargs; ++k) {
       Type *t = CI->getArgOperand(k)->getType();
-      if (!t->isIntegerTy() && !t->isPointerTy()) return false;
+      if (!t->isIntegerTy() && !t->isPointerTy() && !t->isFloatingPointTy())
+        return false;
     }
     Type *retTy = CI->getType();
-    if (!retTy->isVoidTy() && !retTy->isIntegerTy() && !retTy->isPointerTy())
+    if (!retTy->isVoidTy() && !retTy->isIntegerTy() && !retTy->isPointerTy()
+        && !retTy->isFloatingPointTy())
       return false;
 
     // Materialise all arguments into virtual registers.
@@ -776,8 +1247,129 @@ bool VMPLifter::emitInstr(std::vector<uint8_t> &bc, Instruction &I) {
     }
 
     uint8_t dst = allocVReg(CI);
+    if (dst == UINT8_MAX) return false;
     uint16_t callIdx = lookupCall(callee);
     emitCALL_D(bc, dst, callIdx, argRegs);
+    ++virtInstrCount;
+    return true;
+  }
+
+  // ── AtomicRMWInst — non-atomic lowering ──────────────────────────────────
+  // VMP dispatcher is single-threaded; lowering to load→op→store is safe.
+  // Instruction result = old value (before the operation).
+  if (auto *ARMW = dyn_cast<AtomicRMWInst>(&I)) {
+    uint8_t ptr = materialise(bc, ARMW->getPointerOperand());
+    uint8_t val = materialise(bc, ARMW->getValOperand());
+    if (ptr == UINT8_MAX || val == UINT8_MAX) return false;
+    uint8_t w = getBitWidth(ARMW->getValOperand()->getType());
+    if (w == 0) return false;
+
+    // Step 1: load old value (this is the instruction's result)
+    uint8_t old = allocVReg(ARMW);
+    if (old == UINT8_MAX) return false;
+    emitLOAD(bc, w, old, ptr);
+    ++virtInstrCount;
+
+    // Step 2: compute new value
+    uint8_t newVal = allocScratchReg();
+    if (newVal == UINT8_MAX) return false;
+    switch (ARMW->getOperation()) {
+      case AtomicRMWInst::Add:  emit3R(bc, ADD, newVal, old, val); break;
+      case AtomicRMWInst::Sub:  emit3R(bc, SUB, newVal, old, val); break;
+      case AtomicRMWInst::And:  emit3R(bc, AND, newVal, old, val); break;
+      case AtomicRMWInst::Or:   emit3R(bc, OR,  newVal, old, val); break;
+      case AtomicRMWInst::Xor:  emit3R(bc, XOR, newVal, old, val); break;
+      case AtomicRMWInst::Xchg: emitMOV_RR(bc, newVal, val); break;
+      case AtomicRMWInst::Nand: {
+        uint8_t tmp = allocScratchReg();
+        if (tmp == UINT8_MAX) { freeRegs.push_back(newVal); return false; }
+        emit3R(bc, AND, tmp, old, val);
+        emit2R(bc, NOT, newVal, tmp);
+        freeRegs.push_back(tmp);
+        ++virtInstrCount;
+        break;
+      }
+      default:
+        freeRegs.push_back(newVal);
+        return false; // max/min/umax/umin/float atomics — unsupported
+    }
+    ++virtInstrCount;
+
+    // Step 3: store new value
+    emitSTORE(bc, w, newVal, ptr);
+    ++virtInstrCount;
+    freeRegs.push_back(newVal);
+    return true;
+  }
+
+  // ── AtomicCmpXchgInst — non-atomic lowering ────────────────────────────
+  // Returns {oldVal, success}; users access fields via ExtractValueInst.
+  if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) {
+    uint8_t ptr  = materialise(bc, CX->getPointerOperand());
+    uint8_t cmp  = materialise(bc, CX->getCompareOperand());
+    uint8_t nval = materialise(bc, CX->getNewValOperand());
+    if (ptr == UINT8_MAX || cmp == UINT8_MAX || nval == UINT8_MAX) return false;
+    uint8_t w = getBitWidth(CX->getCompareOperand()->getType());
+    if (w == 0) return false;
+
+    // Step 1: load old value
+    uint8_t old = allocScratchReg();
+    if (old == UINT8_MAX) return false;
+    emitLOAD(bc, w, old, ptr);
+    ++virtInstrCount;
+
+    // Step 2: compare old == expected
+    uint8_t eq = allocScratchReg();
+    if (eq == UINT8_MAX) { freeRegs.push_back(old); return false; }
+    emit3R(bc, ICMP_EQ, eq, old, cmp);
+    ++virtInstrCount;
+
+    // Step 3: select new or old value based on comparison
+    uint8_t storeVal = allocScratchReg();
+    if (storeVal == UINT8_MAX) { freeRegs.push_back(old); freeRegs.push_back(eq); return false; }
+    emitSELECT(bc, storeVal, eq, nval, old);
+    ++virtInstrCount;
+
+    // Step 4: store selected value
+    emitSTORE(bc, w, storeVal, ptr);
+    ++virtInstrCount;
+    freeRegs.push_back(storeVal);
+
+    // Save the (old, success) register pair for ExtractValueInst
+    cmpxchgRegs[CX] = {old, eq};
+    return true;
+  }
+
+  // ── FreezeInst ─────────────────────────────────────────────────────────
+  // freeze %val → returns a well-defined value (removes undef/poison).
+  // At runtime all VM values are concrete, so freeze is a no-op copy.
+  if (auto *FI = dyn_cast<FreezeInst>(&I)) {
+    uint8_t src = materialise(bc, FI->getOperand(0));
+    if (src == UINT8_MAX) return false;
+    uint8_t dst = allocVReg(FI);
+    if (dst == UINT8_MAX) return false;
+    emitMOV_RR(bc, dst, src);
+    ++virtInstrCount;
+    return true;
+  }
+
+  // ── ExtractValueInst — for CmpXchg result extraction ───────────────────
+  if (auto *EV = dyn_cast<ExtractValueInst>(&I)) {
+    // Only support single-level extraction from CmpXchgInst
+    if (EV->getNumIndices() != 1) return false;
+    unsigned idx = EV->getIndices()[0];
+    auto *Agg = EV->getAggregateOperand();
+    auto it = cmpxchgRegs.find(dyn_cast<Instruction>(Agg));
+    if (it == cmpxchgRegs.end()) return false;
+
+    uint8_t srcReg;
+    if (idx == 0)      srcReg = it->second.first;   // old value
+    else if (idx == 1) srcReg = it->second.second;  // success flag
+    else return false;
+
+    uint8_t dst = allocVReg(EV);
+    if (dst == UINT8_MAX) return false;
+    emitMOV_RR(bc, dst, srcReg);
     ++virtInstrCount;
     return true;
   }
@@ -819,6 +1411,29 @@ bool VMPLifter::handleIntrinsic(std::vector<uint8_t> &bc, CallInst &CI) {
       return true; // emit nothing
     default:
       break;
+  }
+
+  // ── llvm.fmuladd → FMUL + FADD ─────────────────────────────────────────
+  // fmuladd(a, b, c) = a * b + c — lower to two VMP instructions.
+  if (iid == Intrinsic::fmuladd) {
+    uint8_t a = materialise(bc, CI.getArgOperand(0));
+    uint8_t b = materialise(bc, CI.getArgOperand(1));
+    uint8_t c = materialise(bc, CI.getArgOperand(2));
+    if (a == UINT8_MAX || b == UINT8_MAX || c == UINT8_MAX) return false;
+    uint8_t fpW = getBitWidth(CI.getType());
+    if (fpW == 0) return false;
+    // tmp = fmul a, b
+    uint8_t tmp = allocScratchReg();
+    if (tmp == UINT8_MAX) return false;
+    emit3R_W(bc, FMUL, tmp, a, b, fpW);
+    ++virtInstrCount;
+    // dst = fadd tmp, c
+    uint8_t dst = allocVReg(&CI);
+    if (dst == UINT8_MAX) { freeRegs.push_back(tmp); return false; }
+    emit3R_W(bc, FADD, dst, tmp, c, fpW);
+    freeRegs.push_back(tmp); // scratch consumed
+    ++virtInstrCount;
+    return true;
   }
 
   // ── Memory intrinsics → lower to libc CALL_D ───────────────────────────
@@ -915,13 +1530,37 @@ std::optional<std::vector<uint8_t>> VMPLifter::lift(Function &F) {
   // ── PHI lowering pre-pass ────────────────────────────────────────────────
   if (!lowerPHIs(F, bc)) return std::nullopt;
 
+  // ── Dead register reclamation pre-scan ─────────────────────────────────
+  computeLastUses(F);
+
   // Conditional branches with PHI nodes on successor edges are now handled
   // via per-edge trampolines in emitBranch().  No pre-scan rejection needed.
 
   // ── Main emission loop — RPO traversal ───────────────────────────────────
   ReversePostOrderTraversal<Function *> RPOT(&F);
 
+  // Helper: emit a random variable-length NOP (NOP/NOP2/NOP3/NOP4) for
+  // anti-pattern recognition.  The random padding bytes look like operands,
+  // making it harder to determine instruction boundaries without the key.
+  auto emitRandomNOP = [&](std::vector<uint8_t> &bc) {
+    xorshift64step(junkRng);
+    switch (junkRng & 3) {
+      case 0: emitNOP(bc); break;
+      case 1: emit8(bc, NOP2); emit8(bc, static_cast<uint8_t>(junkRng >> 8)); break;
+      case 2: emit8(bc, NOP3); emit8(bc, static_cast<uint8_t>(junkRng >> 8));
+              emit8(bc, static_cast<uint8_t>(junkRng >> 16)); break;
+      case 3: emit8(bc, NOP4); emit8(bc, static_cast<uint8_t>(junkRng >> 8));
+              emit8(bc, static_cast<uint8_t>(junkRng >> 16));
+              emit8(bc, static_cast<uint8_t>(junkRng >> 24)); break;
+    }
+  };
+
   for (BasicBlock *BB : RPOT) {
+    // ── Skip LandingPad blocks (exception-only paths) ────────────────────
+    // InvokeInst's unwind successors are skipped; their BBs start with
+    // LandingPadInst which we cannot translate.
+    if (BB->isLandingPad()) continue;
+
     // ── Junk bytecode injection ──────────────────────────────────────────
     // Emit JMP+N_NOPs before each BB.  bbOffset[BB] is recorded AFTER the
     // junk, so all forward references (JMP/JCC targets) correctly skip it.
@@ -944,6 +1583,16 @@ std::optional<std::vector<uint8_t>> VMPLifter::lift(Function &F) {
       // ── Terminators ───────────────────────────────────────────────────
       if (auto *BI = dyn_cast<BranchInst>(&I)) {
         emitBranch(bc, *BI, BB);
+        emitRandomNOP(bc); // P3-c: variable-length NOP injection
+        ++currentInstrIdx;
+        reclaimDeadRegs();
+        continue;
+      }
+      if (auto *SI = dyn_cast<SwitchInst>(&I)) {
+        if (!emitSwitch(bc, *SI, BB)) return std::nullopt;
+        emitRandomNOP(bc);
+        ++currentInstrIdx;
+        reclaimDeadRegs();
         continue;
       }
       if (auto *RI = dyn_cast<ReturnInst>(&I)) {
@@ -956,11 +1605,83 @@ std::optional<std::vector<uint8_t>> VMPLifter::lift(Function &F) {
           emitRET(bc, retReg);
         }
         ++virtInstrCount;
+        // No NOP after RET/RET_VOID — control leaves the dispatcher
+        ++currentInstrIdx;
+        reclaimDeadRegs();
+        continue;
+      }
+
+      // ── InvokeInst — treat as call + JMP to normal dest ────────────────
+      // The unwind (exception) path is ignored; LandingPad BBs are skipped.
+      if (auto *II = dyn_cast<InvokeInst>(&I)) {
+        Function *callee = II->getCalledFunction();
+
+        // Only direct calls with known callee
+        if (!callee || callee->isIntrinsic() || callee->isVarArg())
+          return std::nullopt;
+
+        unsigned nargs = II->arg_size();
+        if (nargs > MAX_CALL_ARGS) return std::nullopt;
+
+        // Validate arg/ret types
+        for (unsigned k = 0; k < nargs; ++k) {
+          Type *t = II->getArgOperand(k)->getType();
+          if (!t->isIntegerTy() && !t->isPointerTy() && !t->isFloatingPointTy())
+            return std::nullopt;
+        }
+        Type *retTy = II->getType();
+        if (!retTy->isVoidTy() && !retTy->isIntegerTy() && !retTy->isPointerTy()
+            && !retTy->isFloatingPointTy())
+          return std::nullopt;
+
+        // Materialise arguments
+        std::vector<uint8_t> argRegs;
+        argRegs.reserve(nargs);
+        for (unsigned k = 0; k < nargs; ++k) {
+          uint8_t r = materialise(bc, II->getArgOperand(k));
+          if (r == UINT8_MAX) return std::nullopt;
+          argRegs.push_back(r);
+        }
+
+        uint8_t dst = allocVReg(II);
+        if (dst == UINT8_MAX) return std::nullopt;
+        uint16_t callIdx = lookupCall(callee);
+        emitCALL_D(bc, dst, callIdx, argRegs);
+        ++virtInstrCount;
+
+        // Emit phi movs for normal successor, then JMP to it
+        BasicBlock *normalDest = II->getNormalDest();
+        emitPhiMovsForEdge(bc, BB, normalDest);
+        uint32_t patchPos = static_cast<uint32_t>(bc.size()) + 1;
+        uint32_t instrEnd = static_cast<uint32_t>(bc.size()) + 5;
+        emitJMP(bc, 0); // placeholder
+        ++virtInstrCount;
+        auto it = bbOffset.find(normalDest);
+        if (it != bbOffset.end()) {
+          patch32(bc, patchPos, static_cast<int32_t>(it->second) -
+                                static_cast<int32_t>(instrEnd));
+        } else {
+          addFwdRef(patchPos, instrEnd, normalDest);
+        }
+
+        emitRandomNOP(bc);
+        ++currentInstrIdx;
+        reclaimDeadRegs();
         continue;
       }
 
       // ── Regular instructions ───────────────────────────────────────────
-      if (!emitInstr(bc, I)) return std::nullopt;
+      if (!emitInstr(bc, I)) {
+        if (regExhausted) {
+          errs() << "[ArmorComp][VMP] register spill: "
+                 << F.getName() << " (regs exhausted at instr "
+                 << currentInstrIdx << ")\n";
+        }
+        return std::nullopt;
+      }
+      emitRandomNOP(bc); // P3-c: variable-length NOP injection
+      ++currentInstrIdx;
+      reclaimDeadRegs();
     }
   }
 

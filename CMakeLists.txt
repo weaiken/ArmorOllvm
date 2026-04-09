@@ -1356,9 +1356,32 @@ add_custom_target(test-vmp
     -fpass-plugin=$<TARGET_FILE:ArmorComp>
     -O0
     ${CMAKE_SOURCE_DIR}/test/vmp_test.c
+    -lm
     -o ${CMAKE_BINARY_DIR}/vmp_test_aarch64
   DEPENDS ArmorComp
   COMMENT "Compiling test/vmp_test.c with VMP pass → ARM64 Android ELF"
+)
+
+# ---- Test target: Full Pass Compatibility (COMBO) validation -----------
+# Tests ALL 33 passes applied simultaneously to verify no conflicts.
+# Two test functions:
+#   1. all_passes_combo() — 32 annotations (every non-VMP pass)
+#   2. vmp_combo()        — 8 annotations (VMP + AArch64 passes)
+#
+# Expected stderr: all 33 passes processing these functions
+# Expected stdout: ALL TESTS PASSED
+add_custom_target(test-combo
+  COMMAND ${BREW_CLANG}
+    -target aarch64-linux-android21
+    --sysroot=${NDK_SYSROOT}
+    -resource-dir=${NDK_RESOURCE_DIR}
+    -fpass-plugin=$<TARGET_FILE:ArmorComp>
+    -O0
+    ${CMAKE_SOURCE_DIR}/test/combo_test.c
+    -lm
+    -o ${CMAKE_BINARY_DIR}/combo_test_aarch64
+  DEPENDS ArmorComp
+  COMMENT "Compiling test/combo_test.c with ALL passes → ARM64 Android ELF"
 )
 
 # ---- Test target: AntiDebugPass (ADB) validation ----------------------

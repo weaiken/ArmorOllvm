@@ -164,8 +164,14 @@ PreservedAnalyses ReturnValueObfPass::run(Function &F,
   std::vector<ReturnInst *> rets;
   for (BasicBlock &BB : F)
     if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
-      if (RI->getReturnValue())  // skip void returns (shouldn't happen here)
+      if (RI->getReturnValue()) {  // skip void returns (shouldn't happen here)
+        // Guard: skip if preceding instruction is a musttail call (VMP thunk).
+        // Inserting XOR before ret would break the musttail → ret invariant.
+        Instruction *Prev = RI->getPrevNode();
+        if (Prev && isa<CallInst>(Prev) && cast<CallInst>(Prev)->isMustTailCall())
+          continue;
         rets.push_back(RI);
+      }
 
   if (rets.empty()) return PreservedAnalyses::all();
 

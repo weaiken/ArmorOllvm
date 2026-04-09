@@ -14,17 +14,17 @@
 // the binary, defeating static analysis and signature-based decompilation.
 //
 // ── Register File ─────────────────────────────────────────────────────────
-//   64 virtual registers, each 64 bits wide (uint64_t).
+//   128 virtual registers, each 64 bits wide (uint64_t).
 //
 //   R0        : return value (written by RET, read by dispatcher on exit)
 //   R0 – R7   : function arguments (R0 = arg0, R1 = arg1, …, R7 = arg7)
-//   R8 – R63  : general purpose; allocated by VMPLifter for SSA temporaries
+//   R8 – R127 : general purpose; allocated by VMPLifter for SSA temporaries
 //
 // ── Instruction Encoding ──────────────────────────────────────────────────
 // All instructions are variable-length byte sequences.  The first byte is
 // always the opcode.  Operand types and sizes are fixed per opcode:
 //
-//   REG        1 byte   (0–63, identifies a virtual register)
+//   REG        1 byte   (0–127, identifies a virtual register)
 //   IMM8       1 byte   (unsigned, zero-extended to 64 bits)
 //   IMM16      2 bytes  (unsigned, little-endian, zero-extended)
 //   IMM32      4 bytes  (unsigned, little-endian, zero-extended)
@@ -179,6 +179,10 @@ enum Opcode : uint8_t {
   RET        = 0x42,   // REG        (R0 = Rval, then exit)
   RET_VOID   = 0x43,   // —          (void return)
 
+  // ── Super-instructions (fused immediate arithmetic) ────────────────────
+  ADD_I32    = 0x44,   // REG REG imm32  → Rdst = Rsrc + sext(imm32)
+  SUB_I32    = 0x45,   // REG REG imm32  → Rdst = Rsrc - sext(imm32)
+
   // ── Memory ──────────────────────────────────────────────────────────────
   LOAD_8     = 0x50,   // REG REG    (Rdst = *(uint8_t *)Rptr, zero-extended)
   LOAD_16    = 0x51,   // REG REG    (Rdst = *(uint16_t *)Rptr, zero-extended)
@@ -202,18 +206,55 @@ enum Opcode : uint8_t {
   SELECT     = 0x70,   // REG REG REG REG (Rdst = Rcond ? Rtrue : Rfalse)
   CALL       = 0x71,   // REG REG NARGS1 REG... (Rdst = (*Rfn)(args...))
   CALL_D     = 0x72,   // REG IDX16(2B) NARGS1 REG... (direct call: calltab[IDX16](args...))
+
+  // ── Float arithmetic (0x80-0x85) ──────────────────────────────────────
+  FADD       = 0x80,   // REG REG REG WIDTH1  (Rdst = Rlhs +f Rrhs, fpWidth)
+  FSUB       = 0x81,   // REG REG REG WIDTH1
+  FMUL       = 0x82,   // REG REG REG WIDTH1
+  FDIV       = 0x83,   // REG REG REG WIDTH1
+  FREM       = 0x84,   // REG REG REG WIDTH1
+  FNEG       = 0x85,   // REG REG WIDTH1      (Rdst = -Rsrc, fpWidth)
+
+  // ── Float comparison → boolean (0x88-0x8D ordered, 0x8E-0x93 unord.) ──
+  FCMP_OEQ   = 0x88,   // REG REG REG WIDTH1  (ordered equal)
+  FCMP_ONE   = 0x89,   // REG REG REG WIDTH1  (ordered not-equal)
+  FCMP_OLT   = 0x8A,   // REG REG REG WIDTH1  (ordered less-than)
+  FCMP_OLE   = 0x8B,   // REG REG REG WIDTH1  (ordered less-or-equal)
+  FCMP_OGT   = 0x8C,   // REG REG REG WIDTH1  (ordered greater-than)
+  FCMP_OGE   = 0x8D,   // REG REG REG WIDTH1  (ordered greater-or-equal)
+  FCMP_UEQ   = 0x8E,   // REG REG REG WIDTH1  (unordered equal)
+  FCMP_UNE   = 0x8F,   // REG REG REG WIDTH1  (unordered not-equal)
+  FCMP_ULT   = 0x96,   // REG REG REG WIDTH1  (unordered less-than)
+  FCMP_ULE   = 0x97,   // REG REG REG WIDTH1  (unordered less-or-equal)
+  FCMP_UGT   = 0x98,   // REG REG REG WIDTH1  (unordered greater-than)
+  FCMP_UGE   = 0x99,   // REG REG REG WIDTH1  (unordered greater-or-equal)
+  FCMP_ORD   = 0x9A,   // REG REG REG WIDTH1  (ordered: both not NaN)
+  FCMP_UNO   = 0x9B,   // REG REG REG WIDTH1  (unordered: either is NaN)
+
+  // ── Variable-length NOPs (anti-pattern recognition) ──────────────────
+  NOP2       = 0xF0,   // 2 bytes (opcode + 1 random pad byte)
+  NOP3       = 0xF1,   // 3 bytes (opcode + 2 random pad bytes)
+  NOP4       = 0xF2,   // 4 bytes (opcode + 3 random pad bytes)
+
+  // ── Float ↔ Int conversions (0x90-0x95) ────────────────────────────────
+  FPEXT      = 0x90,   // REG REG             (float → double)
+  FPTRUNC    = 0x91,   // REG REG             (double → float)
+  FPTOSI     = 0x92,   // REG REG WIDTH1      (float/double → signed i64; fpWidth)
+  FPTOUI     = 0x93,   // REG REG WIDTH1      (float/double → unsigned i64; fpWidth)
+  SITOFP     = 0x94,   // REG REG WIDTH1      (signed i64 → float/double; fpWidth)
+  UITOFP     = 0x95,   // REG REG WIDTH1      (unsigned i64 → float/double; fpWidth)
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Register constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-static constexpr uint8_t NUM_REGS        = 64;
+static constexpr uint8_t NUM_REGS        = 128;
 static constexpr uint8_t REG_RETVAL      = 0;   // R0 — return value
 static constexpr uint8_t REG_ARG_FIRST   = 0;   // R0–R7 — arguments
 static constexpr uint8_t REG_ARG_LAST    = 7;
-static constexpr uint8_t REG_GP_FIRST    = 8;   // R8–R63 — general purpose
-static constexpr uint8_t REG_GP_LAST     = 63;
+static constexpr uint8_t REG_GP_FIRST    = 8;   // R8–R127 — general purpose
+static constexpr uint8_t REG_GP_LAST     = 127;
 static constexpr uint8_t MAX_CALL_ARGS   = 8;   // matches REG_ARG_LAST - REG_ARG_FIRST + 1
 
 // Width values used in ZEXT / SEXT / TRUNC
@@ -227,12 +268,12 @@ static constexpr uint8_t WIDTH_64 = 64;
 // VMState — layout of the virtual machine's execution context
 //
 // In the LLVM IR dispatcher:
-//   - regs[] is modelled as a single [64 x i64] alloca
+//   - regs[] is modelled as a single [128 x i64] alloca
 //   - pc is an i8* alloca (or kept in a local variable between iterations)
 //   - bc_base is the pointer to the bytecode ConstantDataArray global
 //
 // In a hypothetical C reference implementation:
-//   struct VMState { uint64_t regs[64]; const uint8_t *pc; const uint8_t *bc_base; };
+//   struct VMState { uint64_t regs[128]; const uint8_t *pc; const uint8_t *bc_base; };
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct VMState {
@@ -326,6 +367,20 @@ inline void emit3R(std::vector<uint8_t> &bc, Opcode op,
 // Two-register instructions (NOT, NEG, LOAD_*, STORE_*, PTRTOINT, INTTOPTR).
 inline void emit2R(std::vector<uint8_t> &bc, Opcode op, uint8_t r0, uint8_t r1) {
   emit8(bc, op); emit8(bc, r0); emit8(bc, r1);
+}
+
+// Three-register + trailing width byte (FADD, FSUB, ... FCMP_*).
+inline void emit3R_W(std::vector<uint8_t> &bc, Opcode op,
+                     uint8_t dst, uint8_t lhs, uint8_t rhs, uint8_t w) {
+  emit3R(bc, op, dst, lhs, rhs);
+  emit8(bc, w);
+}
+
+// Two-register + trailing width byte (FNEG, FPTOSI, FPTOUI, SITOFP, UITOFP).
+inline void emit2R_W(std::vector<uint8_t> &bc, Opcode op,
+                     uint8_t dst, uint8_t src, uint8_t w) {
+  emit2R(bc, op, dst, src);
+  emit8(bc, w);
 }
 
 inline void emitJMP(std::vector<uint8_t> &bc, int32_t offset) {
@@ -451,6 +506,9 @@ inline std::string gvtabName(const std::string &fnName) {
 inline uint32_t instrSize(Opcode op, uint8_t nargs = 0) {
   switch (op) {
     case NOP:      return 1;
+    case NOP2:     return 2;
+    case NOP3:     return 3;
+    case NOP4:     return 4;
     case MOV_I8:   return 3;
     case MOV_I16:  return 4;
     case MOV_I32:  return 6;
@@ -481,6 +539,8 @@ inline uint32_t instrSize(Opcode op, uint8_t nargs = 0) {
       return 2;  // opcode + reg
     case RET_VOID:
       return 1;
+    case ADD_I32: case SUB_I32:
+      return 7;  // opcode + dst + src + imm32(4)
     case SELECT:
       return 5;  // opcode + 4 regs
     case MOV_GV:
@@ -490,6 +550,25 @@ inline uint32_t instrSize(Opcode op, uint8_t nargs = 0) {
       return 4 + MAX_CALL_ARGS; // = 12 bytes total
     case CALL_D:
       return 5 + nargs; // opcode + dstReg + idx16 (2B) + nargs byte + nargs regs
+
+    // Float arithmetic (3R + fpWidth)
+    case FADD: case FSUB: case FMUL: case FDIV: case FREM:
+    case FCMP_OEQ: case FCMP_ONE: case FCMP_OLT:
+    case FCMP_OLE: case FCMP_OGT: case FCMP_OGE:
+    case FCMP_UEQ: case FCMP_UNE:
+    case FCMP_ULT: case FCMP_ULE: case FCMP_UGT: case FCMP_UGE:
+    case FCMP_ORD: case FCMP_UNO:
+      return 5;  // opcode + 3 regs + fpWidth
+
+    // Float unary / conversions with fpWidth
+    case FNEG:
+    case FPTOSI: case FPTOUI: case SITOFP: case UITOFP:
+      return 4;  // opcode + 2 regs + fpWidth
+
+    // Float conversions without fpWidth (fixed direction)
+    case FPEXT: case FPTRUNC:
+      return 3;  // opcode + 2 regs
+
     default:
       return 1;
   }
@@ -582,6 +661,318 @@ inline void scrambleBytecode(std::vector<uint8_t> &bc, const OpcodeMap &m) {
       nargs = bc[pos + 4];                       // opc+dst+idx16+nargs+regs
     size_t sz = instrSize(semOp, nargs);
     if (sz == 0) sz = 1;                         // safety: never get stuck
+    pos += sz;
+  }
+}
+
+// ── Super-instruction emitters ────────────────────────────────────────────
+
+inline void emitADD_I32(std::vector<uint8_t> &bc, uint8_t dst, uint8_t src,
+                         uint32_t imm) {
+  emit8(bc, ADD_I32); emit8(bc, dst); emit8(bc, src); emit32(bc, imm);
+}
+inline void emitSUB_I32(std::vector<uint8_t> &bc, uint8_t dst, uint8_t src,
+                         uint32_t imm) {
+  emit8(bc, SUB_I32); emit8(bc, dst); emit8(bc, src); emit32(bc, imm);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bytecode FNV-1a hash — for integrity verification at runtime
+// ─────────────────────────────────────────────────────────────────────────────
+
+inline uint64_t hashBytecode(const std::vector<uint8_t> &bc) {
+  uint64_t h = 14695981039346656037ULL; // FNV-1a offset basis
+  for (uint8_t b : bc) {
+    h ^= static_cast<uint64_t>(b);
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// XTEA encryption — replaces simple XOR for stronger bytecode protection
+//
+// XTEA-CTR mode: uses XTEA as a PRF to generate a keystream; XORs each byte
+// of the bytecode with the keystream.  No padding needed (stream cipher).
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct XTEAKey { uint32_t k[4]; };
+
+inline XTEAKey genXTEAKey(const std::string &fnName) {
+  uint64_t k0 = vmFnv1a(fnName + "_xtea_k0");
+  uint64_t k1 = vmFnv1a(fnName + "_xtea_k1");
+  return {{ static_cast<uint32_t>(k0), static_cast<uint32_t>(k0 >> 32),
+            static_cast<uint32_t>(k1), static_cast<uint32_t>(k1 >> 32) }};
+}
+
+// XTEA encrypt a single 64-bit block (two 32-bit halves), 32 rounds.
+inline void xteaEncryptBlock(uint32_t v[2], const uint32_t key[4]) {
+  uint32_t v0 = v[0], v1 = v[1], sum = 0, delta = 0x9E3779B9;
+  for (int i = 0; i < 32; i++) {
+    v0 += (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3]);
+    sum += delta;
+    v1 += (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3]);
+  }
+  v[0] = v0; v[1] = v1;
+}
+
+// Encrypt bytecode with XTEA-CTR mode (stream cipher, no padding needed).
+inline void encryptBytecodeXTEA(std::vector<uint8_t> &bc, const XTEAKey &key) {
+  for (size_t i = 0; i < bc.size(); i += 8) {
+    uint32_t ctr[2] = { static_cast<uint32_t>(i / 8), 0 };
+    xteaEncryptBlock(ctr, key.k);
+    for (int j = 0; j < 8 && i + j < bc.size(); j++) {
+      uint8_t ks = (j < 4) ? static_cast<uint8_t>(ctr[0] >> (j * 8))
+                            : static_cast<uint8_t>(ctr[1] >> ((j - 4) * 8));
+      bc[i + j] ^= ks;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bytecode disassembler — debug tool, activated via ARMORCOMP_VMP_DISASM env
+// ─────────────────────────────────────────────────────────────────────────────
+
+inline const char *opcodeName(Opcode op) {
+  switch (op) {
+    case NOP:      return "NOP";
+    case NOP2:     return "NOP2";
+    case NOP3:     return "NOP3";
+    case NOP4:     return "NOP4";
+    case MOV_I8:   return "MOV_I8";
+    case MOV_I16:  return "MOV_I16";
+    case MOV_I32:  return "MOV_I32";
+    case MOV_I64:  return "MOV_I64";
+    case MOV_RR:   return "MOV_RR";
+    case MOV_GV:   return "MOV_GV";
+    case ADD:      return "ADD";
+    case SUB:      return "SUB";
+    case MUL:      return "MUL";
+    case UDIV:     return "UDIV";
+    case SDIV:     return "SDIV";
+    case UREM:     return "UREM";
+    case SREM:     return "SREM";
+    case AND:      return "AND";
+    case OR:       return "OR";
+    case XOR:      return "XOR";
+    case SHL:      return "SHL";
+    case LSHR:     return "LSHR";
+    case ASHR:     return "ASHR";
+    case NOT:      return "NOT";
+    case NEG:      return "NEG";
+    case ICMP_EQ:  return "ICMP_EQ";
+    case ICMP_NE:  return "ICMP_NE";
+    case ICMP_SLT: return "ICMP_SLT";
+    case ICMP_SLE: return "ICMP_SLE";
+    case ICMP_SGT: return "ICMP_SGT";
+    case ICMP_SGE: return "ICMP_SGE";
+    case ICMP_ULT: return "ICMP_ULT";
+    case ICMP_ULE: return "ICMP_ULE";
+    case ICMP_UGT: return "ICMP_UGT";
+    case ICMP_UGE: return "ICMP_UGE";
+    case JMP:      return "JMP";
+    case JCC:      return "JCC";
+    case RET:      return "RET";
+    case RET_VOID: return "RET_VOID";
+    case ADD_I32:  return "ADD_I32";
+    case SUB_I32:  return "SUB_I32";
+    case LOAD_8:   return "LOAD_8";
+    case LOAD_16:  return "LOAD_16";
+    case LOAD_32:  return "LOAD_32";
+    case LOAD_64:  return "LOAD_64";
+    case STORE_8:  return "STORE_8";
+    case STORE_16: return "STORE_16";
+    case STORE_32: return "STORE_32";
+    case STORE_64: return "STORE_64";
+    case ALLOCA:   return "ALLOCA";
+    case GEP8:     return "GEP8";
+    case ZEXT:     return "ZEXT";
+    case SEXT:     return "SEXT";
+    case TRUNC:    return "TRUNC";
+    case PTRTOINT: return "PTRTOINT";
+    case INTTOPTR: return "INTTOPTR";
+    case SELECT:   return "SELECT";
+    case CALL:     return "CALL";
+    case CALL_D:   return "CALL_D";
+    case FADD:     return "FADD";
+    case FSUB:     return "FSUB";
+    case FMUL:     return "FMUL";
+    case FDIV:     return "FDIV";
+    case FREM:     return "FREM";
+    case FNEG:     return "FNEG";
+    case FCMP_OEQ: return "FCMP_OEQ";
+    case FCMP_ONE: return "FCMP_ONE";
+    case FCMP_OLT: return "FCMP_OLT";
+    case FCMP_OLE: return "FCMP_OLE";
+    case FCMP_OGT: return "FCMP_OGT";
+    case FCMP_OGE: return "FCMP_OGE";
+    case FCMP_UEQ: return "FCMP_UEQ";
+    case FCMP_UNE: return "FCMP_UNE";
+    case FCMP_ULT: return "FCMP_ULT";
+    case FCMP_ULE: return "FCMP_ULE";
+    case FCMP_UGT: return "FCMP_UGT";
+    case FCMP_UGE: return "FCMP_UGE";
+    case FCMP_ORD: return "FCMP_ORD";
+    case FCMP_UNO: return "FCMP_UNO";
+    case FPEXT:    return "FPEXT";
+    case FPTRUNC:  return "FPTRUNC";
+    case FPTOSI:   return "FPTOSI";
+    case FPTOUI:   return "FPTOUI";
+    case SITOFP:   return "SITOFP";
+    case UITOFP:   return "UITOFP";
+    default:       return "???";
+  }
+}
+
+inline void disassembleBytecode(const std::vector<uint8_t> &bc,
+                                std::string &out) {
+  size_t pos = 0;
+  char buf[128];
+  while (pos < bc.size()) {
+    uint8_t opc = bc[pos];
+    Opcode semOp = static_cast<Opcode>(opc);
+    const char *name = opcodeName(semOp);
+    int n = 0;
+
+    switch (semOp) {
+      case NOP: case RET_VOID:
+        n = snprintf(buf, sizeof(buf), "  [%04x] %s\n", (unsigned)pos, name);
+        break;
+      case NOP2:
+        n = snprintf(buf, sizeof(buf), "  [%04x] NOP2 pad=%02x\n",
+                     (unsigned)pos, bc[pos+1]);
+        break;
+      case NOP3:
+        n = snprintf(buf, sizeof(buf), "  [%04x] NOP3 pad=%02x%02x\n",
+                     (unsigned)pos, bc[pos+1], bc[pos+2]);
+        break;
+      case NOP4:
+        n = snprintf(buf, sizeof(buf), "  [%04x] NOP4 pad=%02x%02x%02x\n",
+                     (unsigned)pos, bc[pos+1], bc[pos+2], bc[pos+3]);
+        break;
+      case MOV_I8:
+        n = snprintf(buf, sizeof(buf), "  [%04x] MOV_I8  R%d, %d\n",
+                     (unsigned)pos, bc[pos+1], bc[pos+2]);
+        break;
+      case MOV_I16: {
+        uint16_t imm = bc[pos+2] | (bc[pos+3] << 8);
+        n = snprintf(buf, sizeof(buf), "  [%04x] MOV_I16 R%d, %u\n",
+                     (unsigned)pos, bc[pos+1], imm);
+        break;
+      }
+      case MOV_I32: {
+        uint32_t imm = bc[pos+2]|(bc[pos+3]<<8)|(bc[pos+4]<<16)|(bc[pos+5]<<24);
+        n = snprintf(buf, sizeof(buf), "  [%04x] MOV_I32 R%d, %u\n",
+                     (unsigned)pos, bc[pos+1], imm);
+        break;
+      }
+      case MOV_I64: {
+        uint64_t imm = 0;
+        for (int i = 0; i < 8; ++i)
+          imm |= (uint64_t)bc[pos+2+i] << (i*8);
+        n = snprintf(buf, sizeof(buf), "  [%04x] MOV_I64 R%d, 0x%llx\n",
+                     (unsigned)pos, bc[pos+1], (unsigned long long)imm);
+        break;
+      }
+      case MOV_RR:
+        n = snprintf(buf, sizeof(buf), "  [%04x] MOV_RR  R%d, R%d\n",
+                     (unsigned)pos, bc[pos+1], bc[pos+2]);
+        break;
+      case MOV_GV: {
+        uint16_t idx = bc[pos+2] | (bc[pos+3] << 8);
+        n = snprintf(buf, sizeof(buf), "  [%04x] MOV_GV  R%d, gv[%u]\n",
+                     (unsigned)pos, bc[pos+1], idx);
+        break;
+      }
+      case RET:
+        n = snprintf(buf, sizeof(buf), "  [%04x] RET     R%d\n",
+                     (unsigned)pos, bc[pos+1]);
+        break;
+      case NOT: case NEG: case PTRTOINT: case INTTOPTR:
+      case LOAD_8: case LOAD_16: case LOAD_32: case LOAD_64:
+      case STORE_8: case STORE_16: case STORE_32: case STORE_64:
+      case FPEXT: case FPTRUNC:
+        n = snprintf(buf, sizeof(buf), "  [%04x] %-8s R%d, R%d\n",
+                     (unsigned)pos, name, bc[pos+1], bc[pos+2]);
+        break;
+      case ADD: case SUB: case MUL: case UDIV: case SDIV: case UREM: case SREM:
+      case AND: case OR: case XOR: case SHL: case LSHR: case ASHR:
+      case ICMP_EQ: case ICMP_NE:
+      case ICMP_SLT: case ICMP_SLE: case ICMP_SGT: case ICMP_SGE:
+      case ICMP_ULT: case ICMP_ULE: case ICMP_UGT: case ICMP_UGE:
+      case GEP8:
+        n = snprintf(buf, sizeof(buf), "  [%04x] %-8s R%d, R%d, R%d\n",
+                     (unsigned)pos, name, bc[pos+1], bc[pos+2], bc[pos+3]);
+        break;
+      case ZEXT: case SEXT: case TRUNC:
+      case FNEG: case FPTOSI: case FPTOUI: case SITOFP: case UITOFP:
+        n = snprintf(buf, sizeof(buf), "  [%04x] %-8s R%d, R%d, w%d\n",
+                     (unsigned)pos, name, bc[pos+1], bc[pos+2], bc[pos+3]);
+        break;
+      case FADD: case FSUB: case FMUL: case FDIV: case FREM:
+      case FCMP_OEQ: case FCMP_ONE: case FCMP_OLT: case FCMP_OLE:
+      case FCMP_OGT: case FCMP_OGE:
+      case FCMP_UEQ: case FCMP_UNE:
+      case FCMP_ULT: case FCMP_ULE: case FCMP_UGT: case FCMP_UGE:
+      case FCMP_ORD: case FCMP_UNO:
+        n = snprintf(buf, sizeof(buf), "  [%04x] %-8s R%d, R%d, R%d, w%d\n",
+                     (unsigned)pos, name, bc[pos+1], bc[pos+2], bc[pos+3], bc[pos+4]);
+        break;
+      case SELECT:
+        n = snprintf(buf, sizeof(buf), "  [%04x] SELECT  R%d, R%d, R%d, R%d\n",
+                     (unsigned)pos, bc[pos+1], bc[pos+2], bc[pos+3], bc[pos+4]);
+        break;
+      case JMP: {
+        int32_t off = (int32_t)(bc[pos+1]|(bc[pos+2]<<8)|(bc[pos+3]<<16)|(bc[pos+4]<<24));
+        n = snprintf(buf, sizeof(buf), "  [%04x] JMP     %+d\n",
+                     (unsigned)pos, off);
+        break;
+      }
+      case JCC: {
+        int32_t ot = (int32_t)(bc[pos+2]|(bc[pos+3]<<8)|(bc[pos+4]<<16)|(bc[pos+5]<<24));
+        int32_t of = (int32_t)(bc[pos+6]|(bc[pos+7]<<8)|(bc[pos+8]<<16)|(bc[pos+9]<<24));
+        n = snprintf(buf, sizeof(buf), "  [%04x] JCC     R%d, t%+d, f%+d\n",
+                     (unsigned)pos, bc[pos+1], ot, of);
+        break;
+      }
+      case ALLOCA: {
+        uint32_t sz = bc[pos+2]|(bc[pos+3]<<8)|(bc[pos+4]<<16)|(bc[pos+5]<<24);
+        n = snprintf(buf, sizeof(buf), "  [%04x] ALLOCA  R%d, %u\n",
+                     (unsigned)pos, bc[pos+1], sz);
+        break;
+      }
+      case ADD_I32: case SUB_I32: {
+        uint32_t imm = bc[pos+3]|(bc[pos+4]<<8)|(bc[pos+5]<<16)|(bc[pos+6]<<24);
+        n = snprintf(buf, sizeof(buf), "  [%04x] %-8s R%d, R%d, %d\n",
+                     (unsigned)pos, name, bc[pos+1], bc[pos+2], (int32_t)imm);
+        break;
+      }
+      case CALL: {
+        uint8_t nargs = bc[pos+3];
+        n = snprintf(buf, sizeof(buf), "  [%04x] CALL    R%d, R%d, nargs=%d\n",
+                     (unsigned)pos, bc[pos+1], bc[pos+2], nargs);
+        break;
+      }
+      case CALL_D: {
+        uint16_t idx = bc[pos+2] | (bc[pos+3] << 8);
+        uint8_t nargs = bc[pos+4];
+        n = snprintf(buf, sizeof(buf), "  [%04x] CALL_D  R%d, fn[%u], nargs=%d\n",
+                     (unsigned)pos, bc[pos+1], idx, nargs);
+        break;
+      }
+      default:
+        n = snprintf(buf, sizeof(buf), "  [%04x] ??? 0x%02x\n",
+                     (unsigned)pos, opc);
+        break;
+    }
+    if (n > 0) out.append(buf, n);
+
+    // For CALL_D, peek nargs for instrSize
+    uint8_t nargs = 0;
+    if (semOp == CALL_D && pos + 4 < bc.size())
+      nargs = bc[pos + 4];
+    size_t sz = instrSize(semOp, nargs);
+    if (sz == 0) sz = 1;
     pos += sz;
   }
 }

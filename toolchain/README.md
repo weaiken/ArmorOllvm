@@ -1,4 +1,7 @@
-# ArmorComp Toolchain — Integration Guide  (v0.26.0)
+# ArmorComp Toolchain — Integration Guide  (v0.27.0)
+
+**33 obfuscation passes** — LLVM 17 out-of-tree plugin for Android NDK & iOS.
+Supports arm64-v8a (full, 33 passes) and armeabi-v7a (IR-level passes; 6 AArch64-only auto-skipped).
 
 This directory is the self-contained delivery package.
 Copy the entire `toolchain/` folder into your project and follow the instructions below.
@@ -177,7 +180,7 @@ int ultra_protect(int x) { ... }
 | `fapi`   | Fake API Call Injection |
 | `gpo`    | Global Pointer Obfuscation |
 | `lob`    | Loop Obfuscation |
-| `vmp`    | Virtual Machine Protection |
+| `vmp`    | Virtual Machine Protection (128-reg VM, XTEA-CTR encryption, opcode scramble, integrity check, dead handlers, handler polymorphism, super-instructions, vararg support) |
 
 ---
 
@@ -204,6 +207,41 @@ functions:
 ```
 
 Config is **additive** with `annotate()` — both can be used simultaneously.
+
+---
+
+## VMP — Virtual Machine Protection
+
+VMPPass is the strongest protection tier. It converts an entire function body into a custom bytecode VM interpreter:
+
+```
+Source Code → LLVM IR → VMPLifter (bytecode) → Opcode Scramble → XTEA-CTR Encrypt → VMPCodeGen (dispatcher)
+```
+
+**Protection layers:**
+- **XTEA-CTR encryption** — 32-round block cipher (per-function key), replaces simple XOR
+- **Per-function opcode scramble** — Fisher-Yates permutation, each function has unique encoding
+- **FNV-1a integrity check** — runtime tamper detection, triggers `trap` on mismatch
+- **16 dead handler BBs** — fake handlers (4 templates) indistinguishable from real ones in IDA
+- **Handler polymorphism** — 6 high-frequency handlers use randomized MBA-equivalent expressions
+- **Super-instructions** — ADD_I32/SUB_I32 fused opcodes reduce dispatch overhead
+- **VarArg support** — wrapper shims for printf/snprintf/etc.
+- **Built-in disassembler** — `ARMORCOMP_VMP_DISASM=1` dumps human-readable bytecode
+
+**VM ISA**: ~50 opcodes, 128 virtual registers (64-bit), integer + float + pointer + atomic operations, direct & indirect calls with float/double ABI.
+
+---
+
+## Recommended Combinations (Anti-F5)
+
+| Goal | Passes | Effect |
+|------|--------|--------|
+| Break IDA F5 | `spo + rao + dpoison` | sp_delta = UNKNOWN |
+| F5 output unreadable | `cff + bcf + mba` | State machine maze |
+| Strongest | `vmp + spo + dpoison` | Algorithm in VM + sp broken |
+| Full stack | `spo + rao + cff + bcf + mba + dpoison` | All layers |
+
+> VMP + CFF should NOT be combined (musttail conflict).
 
 ---
 

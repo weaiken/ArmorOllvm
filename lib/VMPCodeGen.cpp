@@ -15,6 +15,8 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/Support/raw_ostream.h"
@@ -229,8 +231,9 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
                                        GlobalVariable *gvTabGV,
                                        const std::vector<uint8_t> &bc,
                                        const std::vector<Function *> &callTable,
-                                       uint64_t bcKey,
-                                       const armorcomp::vmp::OpcodeMap &opcodeMap) {
+                                       const armorcomp::vmp::XTEAKey &xteaKey,
+                                       const armorcomp::vmp::OpcodeMap &opcodeMap,
+                                       uint64_t bcHash) {
   // ── Create dispatcher function with same type as origF ──────────────────
   std::string dispName = dispatcherName(origF.getName().str());
 
@@ -245,11 +248,13 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
   Disp->addFnAttr(Attribute::OptimizeNone);
 
   // ── Type shortcuts ───────────────────────────────────────────────────────
-  Type *I8Ty   = Type::getInt8Ty(Ctx);
-  Type *I16Ty  = Type::getInt16Ty(Ctx);
-  Type *I32Ty  = Type::getInt32Ty(Ctx);
-  Type *I64Ty  = Type::getInt64Ty(Ctx);
-  Type *PtrTy  = Type::getInt8PtrTy(Ctx);
+  Type *I8Ty     = Type::getInt8Ty(Ctx);
+  Type *I16Ty    = Type::getInt16Ty(Ctx);
+  Type *I32Ty    = Type::getInt32Ty(Ctx);
+  Type *I64Ty    = Type::getInt64Ty(Ctx);
+  Type *PtrTy    = Type::getInt8PtrTy(Ctx);
+  Type *FloatTy  = Type::getFloatTy(Ctx);
+  Type *DoubleTy = Type::getDoubleTy(Ctx);
   ArrayType *RegFileTy = ArrayType::get(I64Ty, NUM_REGS);
   ArrayType *VMStkTy   = ArrayType::get(I8Ty, 4096);
 
@@ -271,12 +276,10 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
   // This makes a runtime stack dump of vm.regs[] show scrambled values rather
   // than the actual computation state, defeating memory-pattern analysis.
   //
-  // Canary derivation: take the low byte of bcKey, replicate 8 times.
+  // Canary derivation: take the low byte of xteaKey.k[0], replicate 8 times.
   // Using a single-byte pattern allows CreateMemSet to initialise the whole
   // register file in one call (memset fills at byte granularity).
-  //   Unwritten reg: stored = regByte × 8, getReg returns regCanary^regCanary = 0
-  //   Written reg:   stored = val ^ regCanary, getReg returns val ^ regCanary ^ regCanary = val
-  uint8_t regByte = static_cast<uint8_t>(bcKey & 0xFF);
+  uint8_t regByte = static_cast<uint8_t>(xteaKey.k[0] & 0xFF);
   if (regByte == 0) regByte = 0xA5; // never use identity (0 XOR = no-op)
   uint64_t regCanary = static_cast<uint64_t>(regByte) * 0x0101010101010101ULL;
   Value *regCanaryV = ConstantInt::get(I64Ty, regCanary);
@@ -301,6 +304,9 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
   // Initialise bump pointer to start of pool
   Value *stkBase = B.CreateBitCast(vmStk, PtrTy, "vm.stkbase");
   B.CreateStore(stkBase, vmStkBP);
+  // Compute end-of-pool for bounds checking in ALLOCA handler
+  Value *stkEnd = B.CreateGEP(I8Ty, stkBase,
+                              ConstantInt::get(I64Ty, 4096), "vm.stkend");
 
   // Decrypt buffer: [bcSize x i8] on stack — receives XOR-decrypted bytecode.
   // The encrypted bytecode global is never directly executed; decrypted here.
@@ -314,43 +320,141 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
   // Branch to decrypt loop header
   B.CreateBr(decLoopBB);
 
-  // ── vm.dec.loop: loop header with PHI for i ───────────────────────────────
+  // ── vm.dec.loop: XTEA-CTR decryption (8-byte blocks) ─────────────────────
   PHINode *decI;
   {
     IRBuilder<> Ldec(decLoopBB);
     decI = Ldec.CreatePHI(I64Ty, 2, "vm.dec.i");
-    decI->addIncoming(ConstantInt::get(I64Ty, 0), entryBB); // loop init
-    Value *done = Ldec.CreateICmpEQ(decI, ConstantInt::get(I64Ty, bcSize), "dec.done");
+    decI->addIncoming(ConstantInt::get(I64Ty, 0), entryBB);
+    Value *done = Ldec.CreateICmpUGE(decI, ConstantInt::get(I64Ty, bcSize), "dec.done");
     Ldec.CreateCondBr(done, decDoneBB, decBodyBB);
   }
 
-  // ── vm.dec.body: decrypt one byte at position i ──────────────────────────
+  // ── vm.dec.body: XTEA-CTR decrypt one 8-byte block ──────────────────────
   {
-    IRBuilder<> Lbody(decBodyBB);
-    // Load encrypted byte from bytecode global
-    Value *srcPtr = Lbody.CreateGEP(I8Ty, bcGVPtr, decI, "dec.src");
-    Value *encByte = Lbody.CreateLoad(I8Ty, srcPtr, "dec.enc");
-    // key byte = (KEY >> ((i % 8) * 8)) & 0xFF — compile-time constant i64
-    Value *iMod8   = Lbody.CreateAnd(decI, ConstantInt::get(I64Ty, 7));
-    Value *shift   = Lbody.CreateMul(iMod8, ConstantInt::get(I64Ty, 8));
-    Value *keyVal  = ConstantInt::get(I64Ty, bcKey);
-    Value *keyShr  = Lbody.CreateLShr(keyVal, shift);
-    Value *keyByte = Lbody.CreateTrunc(keyShr, I8Ty, "dec.keybyte");
-    Value *decByte = Lbody.CreateXor(encByte, keyByte, "dec.byte");
-    // Store decrypted byte to decBuf
-    Value *dstPtr  = Lbody.CreateGEP(I8Ty, decBufPtr, decI, "dec.dst");
-    Lbody.CreateStore(decByte, dstPtr);
-    // Advance loop counter and back-edge
-    Value *iNext = Lbody.CreateAdd(decI, ConstantInt::get(I64Ty, 1), "dec.i.next");
-    decI->addIncoming(iNext, decBodyBB); // close back-edge
-    Lbody.CreateBr(decLoopBB);
+    IRBuilder<> Lb(decBodyBB);
+    // Block index = i / 8  (counter value for CTR mode)
+    Value *blockIdx = Lb.CreateLShr(decI, ConstantInt::get(I64Ty, 3));
+    Value *blockIdx32 = Lb.CreateTrunc(blockIdx, I32Ty);
+
+    // XTEA encrypt counter: v0=blockIdx, v1=0, 32 rounds fully unrolled
+    Value *v0 = blockIdx32;
+    Value *v1 = ConstantInt::get(I32Ty, 0);
+    Constant *keys[4] = {
+      ConstantInt::get(I32Ty, xteaKey.k[0]),
+      ConstantInt::get(I32Ty, xteaKey.k[1]),
+      ConstantInt::get(I32Ty, xteaKey.k[2]),
+      ConstantInt::get(I32Ty, xteaKey.k[3])
+    };
+
+    for (int round = 0; round < 32; ++round) {
+      uint32_t sumVal = static_cast<uint32_t>(round) * 0x9E3779B9U;
+      // v0 += (((v1<<4)^(v1>>5)) + v1) ^ (sum + key[sum & 3])
+      Value *a = Lb.CreateXor(Lb.CreateShl(v1, ConstantInt::get(I32Ty, 4)),
+                               Lb.CreateLShr(v1, ConstantInt::get(I32Ty, 5)));
+      Value *b = Lb.CreateAdd(a, v1);
+      Value *c = Lb.CreateAdd(ConstantInt::get(I32Ty, sumVal), keys[sumVal & 3]);
+      v0 = Lb.CreateAdd(v0, Lb.CreateXor(b, c));
+
+      uint32_t newSum = sumVal + 0x9E3779B9U;
+      // v1 += (((v0<<4)^(v0>>5)) + v0) ^ (sum + key[(sum>>11) & 3])
+      Value *d = Lb.CreateXor(Lb.CreateShl(v0, ConstantInt::get(I32Ty, 4)),
+                               Lb.CreateLShr(v0, ConstantInt::get(I32Ty, 5)));
+      Value *e = Lb.CreateAdd(d, v0);
+      Value *f = Lb.CreateAdd(ConstantInt::get(I32Ty, newSum),
+                               keys[(newSum >> 11) & 3]);
+      v1 = Lb.CreateAdd(v1, Lb.CreateXor(e, f));
+    }
+
+    // XOR each of 8 keystream bytes with encrypted bytecode
+    // Extend v0,v1 to i64 for byte extraction
+    Value *v0_64 = Lb.CreateZExt(v0, I64Ty);
+    Value *v1_64 = Lb.CreateZExt(v1, I64Ty);
+    // Combine into a single 64-bit keystream: v0 is low 32 bits, v1 is high
+    Value *ks64 = Lb.CreateOr(v0_64, Lb.CreateShl(v1_64, ConstantInt::get(I64Ty, 32)));
+
+    for (int j = 0; j < 8; ++j) {
+      Value *byteIdx = Lb.CreateAdd(decI, ConstantInt::get(I64Ty, j));
+      Value *inBounds = Lb.CreateICmpULT(byteIdx, ConstantInt::get(I64Ty, bcSize));
+
+      // Keystream byte
+      Value *ksByte = Lb.CreateTrunc(
+          Lb.CreateLShr(ks64, ConstantInt::get(I64Ty, j * 8)), I8Ty);
+
+      Value *srcPtr = Lb.CreateGEP(I8Ty, bcGVPtr, byteIdx);
+      Value *dstPtr = Lb.CreateGEP(I8Ty, decBufPtr, byteIdx);
+
+      // Conditional decrypt (skip if past bytecode end)
+      BasicBlock *doDecBB = BasicBlock::Create(Ctx, "dec.do", Disp);
+      BasicBlock *contBB  = BasicBlock::Create(Ctx, "dec.cont", Disp);
+      Lb.CreateCondBr(inBounds, doDecBB, contBB);
+
+      {
+        IRBuilder<> Ld(doDecBB);
+        Value *enc = Ld.CreateLoad(I8Ty, srcPtr);
+        Ld.CreateStore(Ld.CreateXor(enc, ksByte), dstPtr);
+        Ld.CreateBr(contBB);
+      }
+
+      Lb.SetInsertPoint(contBB);
+    }
+
+    // Advance loop counter by 8 and back-edge
+    Value *iNext = Lb.CreateAdd(decI, ConstantInt::get(I64Ty, 8), "dec.i.next");
+    decI->addIncoming(iNext, Lb.GetInsertBlock());
+    Lb.CreateBr(decLoopBB);
   }
 
-  // ── vm.dec.done: initialise pc = decBufPtr, load args ────────────────────
+  // ── vm.dec.done: integrity check then initialise pc & args ───────────────
   {
     IRBuilder<> Bdone(decDoneBB);
-    // pc starts at decrypted buffer — NOT the encrypted global
-    Bdone.CreateStore(decBufPtr, pcAlloc);
+
+    // FNV-1a integrity check over decrypted bytecode
+    BasicBlock *hashLoopBB = BasicBlock::Create(Ctx, "vm.hash.loop", Disp);
+    BasicBlock *hashBodyBB = BasicBlock::Create(Ctx, "vm.hash.body", Disp);
+    BasicBlock *hashDoneBB = BasicBlock::Create(Ctx, "vm.hash.done", Disp);
+    BasicBlock *hashFailBB = BasicBlock::Create(Ctx, "vm.hash.fail", Disp);
+    BasicBlock *hashPassBB = BasicBlock::Create(Ctx, "vm.hash.pass", Disp);
+    Bdone.CreateBr(hashLoopBB);
+
+    PHINode *hI, *hHash;
+    {
+      IRBuilder<> Hl(hashLoopBB);
+      hI = Hl.CreatePHI(I64Ty, 2, "h.i");
+      hHash = Hl.CreatePHI(I64Ty, 2, "h.hash");
+      hI->addIncoming(ConstantInt::get(I64Ty, 0), decDoneBB);
+      hHash->addIncoming(ConstantInt::get(I64Ty, 14695981039346656037ULL), decDoneBB);
+      Value *hDone = Hl.CreateICmpEQ(hI, ConstantInt::get(I64Ty, bcSize));
+      Hl.CreateCondBr(hDone, hashDoneBB, hashBodyBB);
+    }
+    {
+      IRBuilder<> Hb(hashBodyBB);
+      Value *bPtr = Hb.CreateGEP(I8Ty, decBufPtr, hI);
+      Value *bVal = Hb.CreateLoad(I8Ty, bPtr);
+      Value *bExt = Hb.CreateZExt(bVal, I64Ty);
+      Value *hXor = Hb.CreateXor(hHash, bExt);
+      Value *hMul = Hb.CreateMul(hXor, ConstantInt::get(I64Ty, 1099511628211ULL));
+      Value *hINext = Hb.CreateAdd(hI, ConstantInt::get(I64Ty, 1));
+      hI->addIncoming(hINext, hashBodyBB);
+      hHash->addIncoming(hMul, hashBodyBB);
+      Hb.CreateBr(hashLoopBB);
+    }
+    {
+      IRBuilder<> Hd(hashDoneBB);
+      Value *expected = ConstantInt::get(I64Ty, bcHash);
+      Value *match = Hd.CreateICmpEQ(hHash, expected, "hash.match");
+      Hd.CreateCondBr(match, hashPassBB, hashFailBB);
+    }
+    {
+      IRBuilder<> Hf(hashFailBB);
+      Function *trapFn = Intrinsic::getDeclaration(&M, Intrinsic::trap);
+      Hf.CreateCall(trapFn);
+      Hf.CreateUnreachable();
+    }
+
+    // hashPassBB: pc + args initialisation
+    IRBuilder<> Bp(hashPassBB);
+    Bp.CreateStore(decBufPtr, pcAlloc);
 
     // Initialise arg registers: regs[i] = (i64) argN
     unsigned argIdx = 0;
@@ -358,23 +462,27 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
       if (argIdx >= MAX_CALL_ARGS) break;
       Value *argVal;
       if (Arg.getType()->isIntegerTy()) {
-        argVal = Bdone.CreateZExtOrBitCast(&Arg, I64Ty);
+        argVal = Bp.CreateZExtOrBitCast(&Arg, I64Ty);
       } else if (Arg.getType()->isPointerTy()) {
-        argVal = Bdone.CreatePtrToInt(&Arg, I64Ty);
+        argVal = Bp.CreatePtrToInt(&Arg, I64Ty);
+      } else if (Arg.getType()->isFloatTy()) {
+        Value *asI32 = Bp.CreateBitCast(&Arg, I32Ty);
+        argVal = Bp.CreateZExt(asI32, I64Ty);
+      } else if (Arg.getType()->isDoubleTy()) {
+        argVal = Bp.CreateBitCast(&Arg, I64Ty);
       } else {
         argVal = ConstantInt::get(I64Ty, 0);
       }
-      Value *regPtr = Bdone.CreateGEP(
+      Value *regPtr = Bp.CreateGEP(
           RegFileTy, regs,
           {ConstantInt::get(I32Ty, 0), ConstantInt::get(I32Ty, argIdx)},
           "arg_reg_ptr");
-      // Encrypt with regCanary so getReg(Ri) returns the correct plaintext.
-      Value *encArg = Bdone.CreateXor(argVal, regCanaryV, "arg.enc");
-      Bdone.CreateStore(encArg, regPtr);
+      Value *encArg = Bp.CreateXor(argVal, regCanaryV, "arg.enc");
+      Bp.CreateStore(encArg, regPtr);
       ++argIdx;
     }
 
-    Bdone.CreateBr(dispBB);
+    Bp.CreateBr(dispBB);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -488,8 +596,27 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
       return bb;
     };
 
-    // ── NOP ──────────────────────────────────────────────────────────────
+    // ── Handler polymorphism ──────────────────────────────────────────
+    // Deterministic LCG seeded from bcKey: each function gets different
+    // MBA variants, but the same function always gets the same choice.
+    uint64_t polyRng = (static_cast<uint64_t>(xteaKey.k[1]) << 32)
+                     | static_cast<uint64_t>(xteaKey.k[0]);
+    auto polyChoice = [&]() -> bool {
+      polyRng = polyRng * 6364136223846793005ULL + 1442695040888963407ULL;
+      return (polyRng >> 32) & 1;
+    };
+
+    // ── NOP / Variable-length NOPs ─────────────────────────────────────
     addCase(NOP, mkHandler("nop", [&](IRBuilder<> &) {}));
+    addCase(NOP2, mkHandler("nop2", [&](IRBuilder<> &h) {
+      readByte(h); // skip 1 padding byte
+    }));
+    addCase(NOP3, mkHandler("nop3", [&](IRBuilder<> &h) {
+      readByte(h); readByte(h); // skip 2 padding bytes
+    }));
+    addCase(NOP4, mkHandler("nop4", [&](IRBuilder<> &h) {
+      readByte(h); readByte(h); readByte(h); // skip 3 padding bytes
+    }));
 
     // ── MOV_I8: dst = zext imm8 to i64 ───────────────────────────────────
     addCase(MOV_I8, mkHandler("mov_i8", [&](IRBuilder<> &h) {
@@ -566,26 +693,83 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
       }));
     };
 
-    mkBinOp(ADD,  "add",  [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateAdd(l,r); });
-    mkBinOp(SUB,  "sub",  [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateSub(l,r); });
+    // ── Polymorphic binary ops: 50% chance of MBA-equivalent expression ──
+    // ADD: a+b or (a^b) + 2*(a&b)  [carry-add decomposition]
+    if (polyChoice()) {
+      mkBinOp(ADD, "add", [](IRBuilder<> &h, Value *l, Value *r) {
+        Value *x = h.CreateXor(l, r);
+        Value *a = h.CreateAnd(l, r);
+        Value *tw = h.CreateShl(a, ConstantInt::get(l->getType(), 1));
+        return h.CreateAdd(x, tw);
+      });
+    } else {
+      mkBinOp(ADD, "add", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateAdd(l,r); });
+    }
+
+    // SUB: a-b or a + (~b) + 1  [two's complement negation]
+    if (polyChoice()) {
+      mkBinOp(SUB, "sub", [](IRBuilder<> &h, Value *l, Value *r) {
+        Value *nb = h.CreateNot(r);
+        Value *s = h.CreateAdd(l, nb);
+        return h.CreateAdd(s, ConstantInt::get(l->getType(), 1));
+      });
+    } else {
+      mkBinOp(SUB, "sub", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateSub(l,r); });
+    }
+
     mkBinOp(MUL,  "mul",  [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateMul(l,r); });
     mkBinOp(UDIV, "udiv", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateUDiv(l,r); });
     mkBinOp(SDIV, "sdiv", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateSDiv(l,r); });
     mkBinOp(UREM, "urem", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateURem(l,r); });
     mkBinOp(SREM, "srem", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateSRem(l,r); });
-    mkBinOp(AND,  "and",  [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateAnd(l,r); });
-    mkBinOp(OR,   "or",   [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateOr(l,r); });
-    mkBinOp(XOR,  "xor",  [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateXor(l,r); });
+
+    // AND: a&b or ~(~a | ~b)  [De Morgan's law]
+    if (polyChoice()) {
+      mkBinOp(AND, "and", [](IRBuilder<> &h, Value *l, Value *r) {
+        return h.CreateNot(h.CreateOr(h.CreateNot(l), h.CreateNot(r)));
+      });
+    } else {
+      mkBinOp(AND, "and", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateAnd(l,r); });
+    }
+
+    // OR: a|b or ~(~a & ~b)  [De Morgan's law]
+    if (polyChoice()) {
+      mkBinOp(OR, "or", [](IRBuilder<> &h, Value *l, Value *r) {
+        return h.CreateNot(h.CreateAnd(h.CreateNot(l), h.CreateNot(r)));
+      });
+    } else {
+      mkBinOp(OR, "or", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateOr(l,r); });
+    }
+
+    // XOR: a^b or (a|b) - (a&b)  [set-difference identity]
+    if (polyChoice()) {
+      mkBinOp(XOR, "xor", [](IRBuilder<> &h, Value *l, Value *r) {
+        return h.CreateSub(h.CreateOr(l, r), h.CreateAnd(l, r));
+      });
+    } else {
+      mkBinOp(XOR, "xor", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateXor(l,r); });
+    }
+
     mkBinOp(SHL,  "shl",  [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateShl(l,r); });
     mkBinOp(LSHR, "lshr", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateLShr(l,r); });
     mkBinOp(ASHR, "ashr", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateAShr(l,r); });
 
-    // ── NOT / NEG ─────────────────────────────────────────────────────────
-    addCase(NOT, mkHandler("not", [&](IRBuilder<> &h) {
-      Value *dst = readByte(h);
-      Value *src = getReg(h, readByte(h));
-      setReg(h, dst, h.CreateNot(src));
-    }));
+    // ── NOT / NEG (NOT is polymorphic) ────────────────────────────────────
+    // NOT: ~a or (-a) - 1  [identity: -a = ~a + 1, so ~a = -a - 1]
+    if (polyChoice()) {
+      addCase(NOT, mkHandler("not", [&](IRBuilder<> &h) {
+        Value *dst = readByte(h);
+        Value *src = getReg(h, readByte(h));
+        Value *neg = h.CreateNeg(src);
+        setReg(h, dst, h.CreateSub(neg, ConstantInt::get(I64Ty, 1)));
+      }));
+    } else {
+      addCase(NOT, mkHandler("not", [&](IRBuilder<> &h) {
+        Value *dst = readByte(h);
+        Value *src = getReg(h, readByte(h));
+        setReg(h, dst, h.CreateNot(src));
+      }));
+    }
     addCase(NEG, mkHandler("neg", [&](IRBuilder<> &h) {
       Value *dst = readByte(h);
       Value *src = getReg(h, readByte(h));
@@ -615,6 +799,270 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
     mkCmp(ICMP_ULE, "icmp.ule", ICmpInst::ICMP_ULE);
     mkCmp(ICMP_UGT, "icmp.ugt", ICmpInst::ICMP_UGT);
     mkCmp(ICMP_UGE, "icmp.uge", ICmpInst::ICMP_UGE);
+
+    // ── Float binary arithmetic (condBr split: f32 / f64) ───────────────────
+    auto mkFBinOp = [&](uint8_t opc_val, const std::string &nm,
+        std::function<Value*(IRBuilder<>&, Value*, Value*)> opFn) {
+      BasicBlock *eBB = BasicBlock::Create(Ctx, "h_" + nm, Disp);
+      addCase(opc_val, eBB);
+      IRBuilder<> he(eBB);
+      Value *dst   = readByte(he);
+      Value *lhs64 = getReg(he, readByte(he));
+      Value *rhs64 = getReg(he, readByte(he));
+      Value *fpW   = readByte(he);
+      Value *isF32 = he.CreateICmpEQ(fpW, ConstantInt::get(I8Ty, 32));
+
+      BasicBlock *f32BB = BasicBlock::Create(Ctx, nm + ".f32", Disp);
+      {
+        IRBuilder<> h32(f32BB);
+        Value *lf  = h32.CreateBitCast(h32.CreateTrunc(lhs64, I32Ty), FloatTy);
+        Value *rf  = h32.CreateBitCast(h32.CreateTrunc(rhs64, I32Ty), FloatTy);
+        Value *r32 = opFn(h32, lf, rf);
+        Value *ri  = h32.CreateZExt(h32.CreateBitCast(r32, I32Ty), I64Ty);
+        setReg(h32, dst, ri);
+        h32.CreateBr(dispBB);
+      }
+
+      BasicBlock *f64BB = BasicBlock::Create(Ctx, nm + ".f64", Disp);
+      {
+        IRBuilder<> h64(f64BB);
+        Value *ld  = h64.CreateBitCast(lhs64, DoubleTy);
+        Value *rd  = h64.CreateBitCast(rhs64, DoubleTy);
+        Value *r64 = opFn(h64, ld, rd);
+        Value *ri  = h64.CreateBitCast(r64, I64Ty);
+        setReg(h64, dst, ri);
+        h64.CreateBr(dispBB);
+      }
+
+      he.CreateCondBr(isF32, f32BB, f64BB);
+    };
+
+    mkFBinOp(FADD, "fadd", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateFAdd(l,r); });
+    mkFBinOp(FSUB, "fsub", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateFSub(l,r); });
+    mkFBinOp(FMUL, "fmul", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateFMul(l,r); });
+    mkFBinOp(FDIV, "fdiv", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateFDiv(l,r); });
+    mkFBinOp(FREM, "frem", [](IRBuilder<> &h, Value *l, Value *r){ return h.CreateFRem(l,r); });
+
+    // ── FNEG (condBr split) ─────────────────────────────────────────────────
+    {
+      BasicBlock *eBB = BasicBlock::Create(Ctx, "h_fneg", Disp);
+      addCase(FNEG, eBB);
+      IRBuilder<> he(eBB);
+      Value *dst   = readByte(he);
+      Value *src64 = getReg(he, readByte(he));
+      Value *fpW   = readByte(he);
+      Value *isF32 = he.CreateICmpEQ(fpW, ConstantInt::get(I8Ty, 32));
+
+      BasicBlock *f32BB = BasicBlock::Create(Ctx, "fneg.f32", Disp);
+      {
+        IRBuilder<> h32(f32BB);
+        Value *fv  = h32.CreateBitCast(h32.CreateTrunc(src64, I32Ty), FloatTy);
+        Value *neg = h32.CreateFNeg(fv);
+        Value *ri  = h32.CreateZExt(h32.CreateBitCast(neg, I32Ty), I64Ty);
+        setReg(h32, dst, ri);
+        h32.CreateBr(dispBB);
+      }
+
+      BasicBlock *f64BB = BasicBlock::Create(Ctx, "fneg.f64", Disp);
+      {
+        IRBuilder<> h64(f64BB);
+        Value *dv  = h64.CreateBitCast(src64, DoubleTy);
+        Value *neg = h64.CreateFNeg(dv);
+        Value *ri  = h64.CreateBitCast(neg, I64Ty);
+        setReg(h64, dst, ri);
+        h64.CreateBr(dispBB);
+      }
+
+      he.CreateCondBr(isF32, f32BB, f64BB);
+    }
+
+    // ── FCmp ops (condBr split: f32 / f64) ──────────────────────────────────
+    auto mkFCmp = [&](uint8_t opc_val, const std::string &nm,
+                      FCmpInst::Predicate pred) {
+      BasicBlock *eBB = BasicBlock::Create(Ctx, "h_" + nm, Disp);
+      addCase(opc_val, eBB);
+      IRBuilder<> he(eBB);
+      Value *dst   = readByte(he);
+      Value *lhs64 = getReg(he, readByte(he));
+      Value *rhs64 = getReg(he, readByte(he));
+      Value *fpW   = readByte(he);
+      Value *isF32 = he.CreateICmpEQ(fpW, ConstantInt::get(I8Ty, 32));
+
+      BasicBlock *f32BB = BasicBlock::Create(Ctx, nm + ".f32", Disp);
+      {
+        IRBuilder<> h32(f32BB);
+        Value *lf  = h32.CreateBitCast(h32.CreateTrunc(lhs64, I32Ty), FloatTy);
+        Value *rf  = h32.CreateBitCast(h32.CreateTrunc(rhs64, I32Ty), FloatTy);
+        Value *cmp = h32.CreateFCmp(pred, lf, rf);
+        setReg(h32, dst, h32.CreateZExt(cmp, I64Ty));
+        h32.CreateBr(dispBB);
+      }
+
+      BasicBlock *f64BB = BasicBlock::Create(Ctx, nm + ".f64", Disp);
+      {
+        IRBuilder<> h64(f64BB);
+        Value *ld  = h64.CreateBitCast(lhs64, DoubleTy);
+        Value *rd  = h64.CreateBitCast(rhs64, DoubleTy);
+        Value *cmp = h64.CreateFCmp(pred, ld, rd);
+        setReg(h64, dst, h64.CreateZExt(cmp, I64Ty));
+        h64.CreateBr(dispBB);
+      }
+
+      he.CreateCondBr(isF32, f32BB, f64BB);
+    };
+
+    mkFCmp(FCMP_OEQ, "fcmp.oeq", FCmpInst::FCMP_OEQ);
+    mkFCmp(FCMP_ONE, "fcmp.one", FCmpInst::FCMP_ONE);
+    mkFCmp(FCMP_OLT, "fcmp.olt", FCmpInst::FCMP_OLT);
+    mkFCmp(FCMP_OLE, "fcmp.ole", FCmpInst::FCMP_OLE);
+    mkFCmp(FCMP_OGT, "fcmp.ogt", FCmpInst::FCMP_OGT);
+    mkFCmp(FCMP_OGE, "fcmp.oge", FCmpInst::FCMP_OGE);
+    mkFCmp(FCMP_UEQ, "fcmp.ueq", FCmpInst::FCMP_UEQ);
+    mkFCmp(FCMP_UNE, "fcmp.une", FCmpInst::FCMP_UNE);
+    mkFCmp(FCMP_ULT, "fcmp.ult", FCmpInst::FCMP_ULT);
+    mkFCmp(FCMP_ULE, "fcmp.ule", FCmpInst::FCMP_ULE);
+    mkFCmp(FCMP_UGT, "fcmp.ugt", FCmpInst::FCMP_UGT);
+    mkFCmp(FCMP_UGE, "fcmp.uge", FCmpInst::FCMP_UGE);
+    mkFCmp(FCMP_ORD, "fcmp.ord", FCmpInst::FCMP_ORD);
+    mkFCmp(FCMP_UNO, "fcmp.uno", FCmpInst::FCMP_UNO);
+
+    // ── FPEXT: float → double (fixed direction) ─────────────────────────────
+    addCase(FPEXT, mkHandler("fpext", [&](IRBuilder<> &h) {
+      Value *dst   = readByte(h);
+      Value *src64 = getReg(h, readByte(h));
+      Value *i32v  = h.CreateTrunc(src64, I32Ty);
+      Value *fv    = h.CreateBitCast(i32v, FloatTy);
+      Value *dv    = h.CreateFPExt(fv, DoubleTy);
+      Value *res   = h.CreateBitCast(dv, I64Ty);
+      setReg(h, dst, res);
+    }));
+
+    // ── FPTRUNC: double → float (fixed direction) ───────────────────────────
+    addCase(FPTRUNC, mkHandler("fptrunc", [&](IRBuilder<> &h) {
+      Value *dst   = readByte(h);
+      Value *src64 = getReg(h, readByte(h));
+      Value *dv    = h.CreateBitCast(src64, DoubleTy);
+      Value *fv    = h.CreateFPTrunc(dv, FloatTy);
+      Value *i32v  = h.CreateBitCast(fv, I32Ty);
+      Value *res   = h.CreateZExt(i32v, I64Ty);
+      setReg(h, dst, res);
+    }));
+
+    // ── FPTOSI: float/double → signed i64 (condBr split) ───────────────────
+    {
+      BasicBlock *eBB = BasicBlock::Create(Ctx, "h_fptosi", Disp);
+      addCase(FPTOSI, eBB);
+      IRBuilder<> he(eBB);
+      Value *dst   = readByte(he);
+      Value *src64 = getReg(he, readByte(he));
+      Value *fpW   = readByte(he);
+      Value *isF32 = he.CreateICmpEQ(fpW, ConstantInt::get(I8Ty, 32));
+
+      BasicBlock *f32BB = BasicBlock::Create(Ctx, "fptosi.f32", Disp);
+      {
+        IRBuilder<> h32(f32BB);
+        Value *fv  = h32.CreateBitCast(h32.CreateTrunc(src64, I32Ty), FloatTy);
+        Value *res = h32.CreateFPToSI(fv, I64Ty);
+        setReg(h32, dst, res);
+        h32.CreateBr(dispBB);
+      }
+      BasicBlock *f64BB = BasicBlock::Create(Ctx, "fptosi.f64", Disp);
+      {
+        IRBuilder<> h64(f64BB);
+        Value *dv  = h64.CreateBitCast(src64, DoubleTy);
+        Value *res = h64.CreateFPToSI(dv, I64Ty);
+        setReg(h64, dst, res);
+        h64.CreateBr(dispBB);
+      }
+      he.CreateCondBr(isF32, f32BB, f64BB);
+    }
+
+    // ── FPTOUI: float/double → unsigned i64 (condBr split) ──────────────────
+    {
+      BasicBlock *eBB = BasicBlock::Create(Ctx, "h_fptoui", Disp);
+      addCase(FPTOUI, eBB);
+      IRBuilder<> he(eBB);
+      Value *dst   = readByte(he);
+      Value *src64 = getReg(he, readByte(he));
+      Value *fpW   = readByte(he);
+      Value *isF32 = he.CreateICmpEQ(fpW, ConstantInt::get(I8Ty, 32));
+
+      BasicBlock *f32BB = BasicBlock::Create(Ctx, "fptoui.f32", Disp);
+      {
+        IRBuilder<> h32(f32BB);
+        Value *fv  = h32.CreateBitCast(h32.CreateTrunc(src64, I32Ty), FloatTy);
+        Value *res = h32.CreateFPToUI(fv, I64Ty);
+        setReg(h32, dst, res);
+        h32.CreateBr(dispBB);
+      }
+      BasicBlock *f64BB = BasicBlock::Create(Ctx, "fptoui.f64", Disp);
+      {
+        IRBuilder<> h64(f64BB);
+        Value *dv  = h64.CreateBitCast(src64, DoubleTy);
+        Value *res = h64.CreateFPToUI(dv, I64Ty);
+        setReg(h64, dst, res);
+        h64.CreateBr(dispBB);
+      }
+      he.CreateCondBr(isF32, f32BB, f64BB);
+    }
+
+    // ── SITOFP: signed i64 → float/double (condBr split) ────────────────────
+    {
+      BasicBlock *eBB = BasicBlock::Create(Ctx, "h_sitofp", Disp);
+      addCase(SITOFP, eBB);
+      IRBuilder<> he(eBB);
+      Value *dst   = readByte(he);
+      Value *src64 = getReg(he, readByte(he));
+      Value *fpW   = readByte(he);
+      Value *isF32 = he.CreateICmpEQ(fpW, ConstantInt::get(I8Ty, 32));
+
+      BasicBlock *f32BB = BasicBlock::Create(Ctx, "sitofp.f32", Disp);
+      {
+        IRBuilder<> h32(f32BB);
+        Value *fv  = h32.CreateSIToFP(src64, FloatTy);
+        Value *ri  = h32.CreateZExt(h32.CreateBitCast(fv, I32Ty), I64Ty);
+        setReg(h32, dst, ri);
+        h32.CreateBr(dispBB);
+      }
+      BasicBlock *f64BB = BasicBlock::Create(Ctx, "sitofp.f64", Disp);
+      {
+        IRBuilder<> h64(f64BB);
+        Value *dv  = h64.CreateSIToFP(src64, DoubleTy);
+        Value *ri  = h64.CreateBitCast(dv, I64Ty);
+        setReg(h64, dst, ri);
+        h64.CreateBr(dispBB);
+      }
+      he.CreateCondBr(isF32, f32BB, f64BB);
+    }
+
+    // ── UITOFP: unsigned i64 → float/double (condBr split) ──────────────────
+    {
+      BasicBlock *eBB = BasicBlock::Create(Ctx, "h_uitofp", Disp);
+      addCase(UITOFP, eBB);
+      IRBuilder<> he(eBB);
+      Value *dst   = readByte(he);
+      Value *src64 = getReg(he, readByte(he));
+      Value *fpW   = readByte(he);
+      Value *isF32 = he.CreateICmpEQ(fpW, ConstantInt::get(I8Ty, 32));
+
+      BasicBlock *f32BB = BasicBlock::Create(Ctx, "uitofp.f32", Disp);
+      {
+        IRBuilder<> h32(f32BB);
+        Value *fv  = h32.CreateUIToFP(src64, FloatTy);
+        Value *ri  = h32.CreateZExt(h32.CreateBitCast(fv, I32Ty), I64Ty);
+        setReg(h32, dst, ri);
+        h32.CreateBr(dispBB);
+      }
+      BasicBlock *f64BB = BasicBlock::Create(Ctx, "uitofp.f64", Disp);
+      {
+        IRBuilder<> h64(f64BB);
+        Value *dv  = h64.CreateUIToFP(src64, DoubleTy);
+        Value *ri  = h64.CreateBitCast(dv, I64Ty);
+        setReg(h64, dst, ri);
+        h64.CreateBr(dispBB);
+      }
+      he.CreateCondBr(isF32, f32BB, f64BB);
+    }
 
     // ── JMP: offset32, relative to instruction end ─────────────────────────
     addCase(JMP, mkHandler("jmp", [&](IRBuilder<> &h) {
@@ -680,16 +1128,22 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
     mkStore(STORE_32, "store32", I32Ty, 32);
     mkStore(STORE_64, "store64", I64Ty, 64);
 
-    // ── ALLOCA: bump-pointer allocation ───────────────────────────────────
+    // ── ALLOCA: bump-pointer allocation with bounds check ─────────────────
     addCase(ALLOCA, mkHandler("alloca", [&](IRBuilder<> &h) {
       Value *dst   = readByte(h);
       Value *sz32  = readU32(h);
       Value *sz64  = h.CreateZExt(sz32, I64Ty);
       Value *bp    = h.CreateLoad(PtrTy, vmStkBP, "bp");
       Value *nbp   = h.CreateGEP(I8Ty, bp, sz64, "nbp");
-      h.CreateStore(nbp, vmStkBP);
-      Value *ptr64 = h.CreatePtrToInt(bp, I64Ty);
-      setReg(h, dst, ptr64);
+      // Bounds check: if nbp > stkEnd, overflow — clamp to bp (no-op alloca)
+      Value *overflow = h.CreateICmpUGT(nbp, stkEnd, "alloca.ovf");
+      Value *safeNbp  = h.CreateSelect(overflow, bp, nbp);
+      h.CreateStore(safeNbp, vmStkBP);
+      // On overflow return null (0); otherwise return allocated base
+      Value *ptr64   = h.CreatePtrToInt(bp, I64Ty);
+      Value *safePtr = h.CreateSelect(overflow,
+                                      ConstantInt::get(I64Ty, 0), ptr64);
+      setReg(h, dst, safePtr);
     }));
 
     // ── GEP8 ─────────────────────────────────────────────────────────────
@@ -804,6 +1258,11 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
             coerced = hc.CreateTruncOrBitCast(argVal64, paramTy);
           else if (paramTy->isPointerTy())
             coerced = hc.CreateIntToPtr(argVal64, paramTy);
+          else if (paramTy->isFloatTy()) {
+            Value *asI32 = hc.CreateTrunc(argVal64, I32Ty);
+            coerced = hc.CreateBitCast(asI32, FloatTy);
+          } else if (paramTy->isDoubleTy())
+            coerced = hc.CreateBitCast(argVal64, DoubleTy);
           else
             coerced = hc.CreateTruncOrBitCast(argVal64, paramTy);
           callArgs.push_back(coerced);
@@ -821,6 +1280,11 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
           retVal64 = hc.CreateZExtOrBitCast(callI, I64Ty);
         else if (retTy->isPointerTy())
           retVal64 = hc.CreatePtrToInt(callI, I64Ty);
+        else if (retTy->isFloatTy()) {
+          Value *asI32 = hc.CreateBitCast(callI, I32Ty);
+          retVal64 = hc.CreateZExt(asI32, I64Ty);
+        } else if (retTy->isDoubleTy())
+          retVal64 = hc.CreateBitCast(callI, I64Ty);
         else
           retVal64 = ConstantInt::get(I64Ty, 0);
 
@@ -863,6 +1327,26 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
       setReg(h, dstReg, callI);
     }));
 
+    // ── ADD_I32: Rdst = Rsrc + sext(imm32) ─────────────────────────────
+    addCase(ADD_I32, mkHandler("add_i32", [&](IRBuilder<> &h) {
+      Value *dst = readByte(h);
+      Value *src = readByte(h);
+      Value *imm = readI32(h);
+      Value *immExt = h.CreateSExt(imm, I64Ty);
+      Value *v = getReg(h, src);
+      setReg(h, dst, h.CreateAdd(v, immExt));
+    }));
+
+    // ── SUB_I32: Rdst = Rsrc - sext(imm32) ─────────────────────────────
+    addCase(SUB_I32, mkHandler("sub_i32", [&](IRBuilder<> &h) {
+      Value *dst = readByte(h);
+      Value *src = readByte(h);
+      Value *imm = readI32(h);
+      Value *immExt = h.CreateSExt(imm, I64Ty);
+      Value *v = getReg(h, src);
+      setReg(h, dst, h.CreateSub(v, immExt));
+    }));
+
     // ── RET: set R0, jump to retBB ────────────────────────────────────────
     {
       BasicBlock *retHandler = BasicBlock::Create(Ctx, "h_ret", Disp);
@@ -881,6 +1365,51 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
       IRBuilder<> h(rvHandler);
       h.CreateBr(retVoidBB);
       addCase(RET_VOID, rvHandler);
+    }
+    // ── Dead Handler Injection ─────────────────────────────────────────
+    // 16 fake unreachable handlers using 4 templates.  These BBs look
+    // like real handlers to IDA but are never reached (the lifter never
+    // emits these semantic opcodes, and Fisher-Yates scramble hides the
+    // mapping).  Increases handler count from ~48 → ~64.
+    {
+      static const uint8_t fakeOpcodes[] = {
+        0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,
+        0x17,0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E
+      };
+      for (unsigned fi = 0; fi < 16; ++fi) {
+        uint8_t fakeOpc = fakeOpcodes[fi];
+        std::string fn = "op" + std::to_string((int)fakeOpc);
+        switch (fi % 4) {
+        case 0: // Fake Binary: readByte×3 → add → setReg
+          addCase(fakeOpc, mkHandler(fn, [&](IRBuilder<> &h) {
+            Value *d = readByte(h); Value *a = getReg(h, readByte(h));
+            Value *b = getReg(h, readByte(h));
+            setReg(h, d, h.CreateAdd(a, b));
+          }));
+          break;
+        case 1: // Fake Load: readByte×2 → load i64 → setReg
+          addCase(fakeOpc, mkHandler(fn, [&](IRBuilder<> &h) {
+            Value *d = readByte(h); Value *p = getReg(h, readByte(h));
+            Value *ptr = h.CreateIntToPtr(p, I64Ty->getPointerTo());
+            setReg(h, d, h.CreateLoad(I64Ty, ptr));
+          }));
+          break;
+        case 2: // Fake Compare: readByte×3 → icmp slt → setReg
+          addCase(fakeOpc, mkHandler(fn, [&](IRBuilder<> &h) {
+            Value *d = readByte(h); Value *a = getReg(h, readByte(h));
+            Value *b = getReg(h, readByte(h));
+            Value *c = h.CreateICmpSLT(a, b);
+            setReg(h, d, h.CreateZExt(c, I64Ty));
+          }));
+          break;
+        case 3: // Fake Jump: readByte → readI32 → branch back (no-op)
+          addCase(fakeOpc, mkHandler(fn, [&](IRBuilder<> &h) {
+            (void)readByte(h); (void)readI32(h);
+            // handler body does nothing useful, loops back to dispatch
+          }));
+          break;
+        }
+      }
     }
   } // end dispatch BB scope
 
@@ -902,8 +1431,12 @@ Function *VMPCodeGen::buildDispatcher(Function &origF,
         retVal = B3.CreateTruncOrBitCast(r0, retTy);
       } else if (retTy->isPointerTy()) {
         retVal = B3.CreateIntToPtr(r0, retTy);
+      } else if (retTy->isFloatTy()) {
+        Value *asI32 = B3.CreateTrunc(r0, I32Ty);
+        retVal = B3.CreateBitCast(asI32, retTy);
+      } else if (retTy->isDoubleTy()) {
+        retVal = B3.CreateBitCast(r0, retTy);
       } else {
-        // Fallback: bitcast (may be wrong for floats, but keeps IR valid)
         retVal = B3.CreateTruncOrBitCast(r0, retTy);
       }
       B3.CreateRet(retVal);
@@ -979,15 +1512,19 @@ bool VMPCodeGen::virtualize(Function &F,
                              const std::vector<uint8_t> &bc,
                              const std::vector<GlobalValue *> &gvTable,
                              const std::vector<Function *> &callTable,
-                             uint64_t bcKey,
-                             const armorcomp::vmp::OpcodeMap &opcodeMap) {
+                             const armorcomp::vmp::XTEAKey &xteaKey,
+                             const armorcomp::vmp::OpcodeMap &opcodeMap,
+                             uint64_t bcHash) {
   if (bc.empty()) return false;
 
+  // Derive a 64-bit key for the bcKey GV (backward-compat with key global).
+  uint64_t bcKeyLegacy = (static_cast<uint64_t>(xteaKey.k[1]) << 32)
+                        | static_cast<uint64_t>(xteaKey.k[0]);
   GlobalVariable *bcGV    = injectBytecode(F, bc);
-  (void)injectBcKey(F, bcKey);                           // store key as module GV
+  (void)injectBcKey(F, bcKeyLegacy);
   GlobalVariable *gvTabGV = injectGVTable(F, gvTable);
   Function *dispatcher    = buildDispatcher(F, bcGV, gvTabGV, bc, callTable,
-                                            bcKey, opcodeMap);
+                                            xteaKey, opcodeMap, bcHash);
 
   if (!dispatcher) return false;
 

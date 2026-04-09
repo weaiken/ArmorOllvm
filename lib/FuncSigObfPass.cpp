@@ -226,8 +226,14 @@ PreservedAnalyses FuncSigObfPass::run(Function &F,
   // Snapshot ret instructions before modifying the function
   std::vector<ReturnInst *> rets;
   for (BasicBlock &BB : F)
-    if (auto *Ret = dyn_cast<ReturnInst>(BB.getTerminator()))
+    if (auto *Ret = dyn_cast<ReturnInst>(BB.getTerminator())) {
+      // Guard: skip if preceding instruction is a musttail call (VMP thunk).
+      // Inserting fake-retval writes before ret would break musttail invariant.
+      Instruction *Prev = Ret->getPrevNode();
+      if (Prev && isa<CallInst>(Prev) && cast<CallInst>(Prev)->isMustTailCall())
+        continue;
       rets.push_back(Ret);
+    }
 
   for (ReturnInst *Ret : rets) {
     IRBuilder<> RetIR(Ret);

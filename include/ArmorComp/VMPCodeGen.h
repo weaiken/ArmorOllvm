@@ -81,15 +81,17 @@ public:
   /// with a thunk that tail-calls the dispatcher.
   /// \p gvTable   — GlobalValues whose runtime addresses are loaded via MOV_GV.
   /// \p callTable — Functions called directly via CALL_D.
-  /// \p bcKey     — 64-bit XOR key; bytecode is pre-encrypted, dispatcher decrypts.
+  /// \p xteaKey   — XTEA key (4×32-bit); bytecode is pre-encrypted, dispatcher decrypts.
   /// \p opcodeMap — Per-function opcode scramble map (semantic→physical bytes).
+  /// \p bcHash    — FNV-1a hash of scrambled (pre-encryption) bytecode for integrity.
   /// Returns true on success.
   bool virtualize(llvm::Function &F,
                   const std::vector<uint8_t> &bc,
                   const std::vector<llvm::GlobalValue *> &gvTable,
                   const std::vector<llvm::Function *> &callTable,
-                  uint64_t bcKey,
-                  const armorcomp::vmp::OpcodeMap &opcodeMap);
+                  const armorcomp::vmp::XTEAKey &xteaKey,
+                  const armorcomp::vmp::OpcodeMap &opcodeMap,
+                  uint64_t bcHash);
 
 private:
   llvm::Module      &M;
@@ -110,15 +112,17 @@ private:
                                        const std::vector<llvm::GlobalValue *> &gvTable);
 
   // ── Dispatcher construction ───────────────────────────────────────────────
-  // bcKey:     key used to encrypt bc (dispatcher decrypts at runtime).
+  // xteaKey:   XTEA key for decryption at runtime.
   // opcodeMap: physical byte values for each semantic opcode.
+  // bcHash:    FNV-1a hash of scrambled bytecode for integrity verification.
   llvm::Function *buildDispatcher(llvm::Function &F,
                                    llvm::GlobalVariable *bcGV,
                                    llvm::GlobalVariable *gvTabGV,
                                    const std::vector<uint8_t> &bc,
                                    const std::vector<llvm::Function *> &callTable,
-                                   uint64_t bcKey,
-                                   const armorcomp::vmp::OpcodeMap &opcodeMap);
+                                   const armorcomp::vmp::XTEAKey &xteaKey,
+                                   const armorcomp::vmp::OpcodeMap &opcodeMap,
+                                   uint64_t bcHash);
 
   // ── Original function replacement ─────────────────────────────────────────
   void replaceWithThunk(llvm::Function &F, llvm::Function *dispatcher);

@@ -1,120 +1,383 @@
-# ArmorComp
+# ArmorComp 中文文档
 
-面向 Android NDK（aarch64）的 OLLVM 风格混淆工具，作为 LLVM 17 的独立插件运行，无需修改 LLVM 源码——只需构建并通过 `-fpass-plugin` 加载即可。
+基于 LLVM 17 的 out-of-tree pass plugin 代码混淆框架，主要面向 Android NDK（arm64-v8a / armeabi-v7a）和 iOS。
+无需修改 LLVM 源码 —— 构建后通过 `-fpass-plugin` 加载即可。
 
-## 混淆 Pass
-
-| Pass | 注解 | -passes= 名称 | 描述 |
-|------|-----------|---------------|-------------|
-| CFFPass | `annotate("cff")` | `armorcomp-cff` | 控制流扁平化 — 分发-switch 循环 |
-| BCFPass | `annotate("bcf")` | `armorcomp-bcf` | 虚假控制流 — 不透明谓词的死分支 |
-| OpaquePredicatePass | `annotate("op")` | `armorcomp-op` | 不透明谓词 — 6 种公式（P0–P2 永真，P3–P5 永假）死分支 |
-| SubPass | `annotate("sub")` | `armorcomp-sub` | 指令替换（13 种 ADD/SUB/AND/OR/XOR 模式） |
-| MBAPass | `annotate("mba")` | `armorcomp-mba` | 混合布尔算术重写（10 种公式） |
-| SplitPass | `annotate("split")` | `armorcomp-split` | 基本块分裂 — 在 BCF/CFF 前膨胀 CFG |
-| StrEncPass | `annotate("strenc")` | `armorcomp-strenc` | 字符串加密 — XOR 密文 + ctor 解密器 |
-| GlobalEncPass | `annotate("genc")`（在使用的函数上） | `armorcomp-genc` | 整数全局加密 — XOR 加密 `i8/i16/i32/i64` 初始化器，注入 ctor 解密器 |
-| IndirectCallPass | `annotate("icall")` | `armorcomp-icall` | 间接调用 — 不透明指针隐藏调用目标 |
-| IndirectBranchPass | `annotate("ibr")` | `armorcomp-ibr` | 间接分支 — `indirectbr` 隐藏分支目标 |
-| IndirectGlobalVariablePass | `annotate("igv")` | `armorcomp-igv` | 间接全局变量 — 代理指针隐藏全局变量引用 |
-| SPOPass | `annotate("spo")` | `armorcomp-spo` | 栈指针混淆 — volatile sub/add SP 击败 IDA sp_delta 分析 |
-| ConstObfPass | `annotate("co")` | `armorcomp-co` | 整数常量混淆 — XOR 密钥拆分隐藏所有数字字面量 |
-| FuncWrapPass | `annotate("fw")` | `armorcomp-fw` | 函数包装混淆 — 内部转发函数隐藏真实调用者 |
-| RetAddrObfPass | `annotate("rao")` | `armorcomp-rao` | 返回地址/调用帧混淆 — 在每个 call 前后使用 volatile sub/add SP |
-| OutlinePass | `annotate("outline")` | `armorcomp-outline` | 基本块提取 — 每个非入口 BB 提取到 `__armorcomp_outline_N`（noinline + optnone） |
-| FlattenDataFlowPass | `annotate("df")` | `armorcomp-df` | 数据流扁平化 — 将所有 alloca 合并到单个 `[N x i8]` 池中，使用混淆的 GEP 索引，击败 IDA/Ghidra 变量恢复 |
-| DataEncodingPass | `annotate("denc")` | `armorcomp-denc` | 局部变量内存编码 — 在每个整数 alloca store/load 前后进行 XOR 编码/解码；栈中始终包含密文 |
-| FuncSigObfPass | `annotate("fsig")` | `armorcomp-fsig` | 函数签名混淆 — 入口处假参数读取（x1/x2/x3）+ 出口处假返回值写入（x1/x2）；干扰 IDA Hex-Rays 原型分析 |
-| DwarfPoisonPass | `annotate("dpoison")` | `armorcomp-dpoison` | DWARF CFI 表污染 — 入口、每个 BB 和每个 ret 处使用 `.cfi_remember_state` + 假 `def_cfa`（sp+524288, x15, x16）+ 未定义 LR/FP + `.cfi_restore_state`；击败 IDA 基于 `.eh_frame` 的 sp_delta 分析 |
-| ConditionObfPass | `annotate("cob")` | `armorcomp-cob` | 比较混淆 — 向两个 `ICmpInst` 操作数添加不透明噪声 `mul(volatile_zero, K)`；IDA Hex-Rays 无法解析条件表达式 |
-| NeonTypeConfusionPass | `annotate("ntc")` | `armorcomp-ntc` | AArch64 NEON/FP 类型混淆 — 入口/出口处的 `fmov` GPR↔SIMD 往返；IDA 类型推断将整数参数注解为 `float`/`double` |
-| ReturnValueObfPass | `annotate("rvo")` | `armorcomp-rvo` | 返回值混淆 — 在 `ret` 前使用 `eor x0/w0, x0/w0, volatile_zero`；IDA 无法静态确定返回类型或值；目标无关的纯 IR |
-| LRObfPass | `annotate("lro")` | `armorcomp-lro` | 链接寄存器混淆 — 在 `ret` 前使用 `eor x30, x30, volatile_zero`；IDA 无法解析返回地址 → 调用者引用变为 JUMPOUT()；仅 AArch64 |
-| GEPObfPass | `annotate("gepo")` | `armorcomp-gepo` | GEP 索引混淆 — 通过 `getelementptr i8` 将 GEP 索引折叠为单个 XOR 混淆的字节偏移；击败 IDA 结构体字段识别、数组下标分析和虚表调度识别 |
-| SwitchObfPass | `annotate("sob")` | `armorcomp-sob` | Switch 语句混淆 — 用密集跳转表 + `indirectbr` 替换 `SwitchInst`；表加载和 `br` 之间的 volatile XOR 击败 IDA switch 模式匹配器 |
-| JunkCodePass | `annotate("jci")` | `armorcomp-jci` | 垃圾代码注入 — 每个 BB 包含死运算链（4–7 个 xor/or/and/shl/lshr/mul/add/sub 操作，volatile-zero 基，`asm sideeffect` 沉降）；击败 IDA Hex-Rays 反编译器清洁输出 |
-| VMPPass | `annotate("vmp")` | `armorcomp-vmp` | 虚拟机保护 — 将 IR 提升到 64 寄存器的自定义字节码 VM；原函数被 fetch-decode-execute 分发器替换；算法对静态分析完全隐藏 |
-
-自动运行顺序（注解模式，optimizer-last 入口点）：
-`STRENC → GENC → VMP → SOB → SPLIT → SUB → MBA → COB → DENC → JCI → CO → GEPO → DF → OUTLINE → BCF → OP → CFF → RAO → ICALL → IBR → IGV → FW → FSIG → SPO → NTC → RVO → LRO → DPOISON`
-
-每个 pass 也有 `-all` 变体（例如 `armorcomp-cff-all`），无需注解即可应用于每个函数。
+**33 个混淆 Pass** | 支持 arm64（完整 33 个） 和 arm32（IR 级 pass；6 个 AArch64 专属自动跳过）
 
 ---
 
-## 构建
+## 目录
 
-要求：LLVM 17（Homebrew `llvm@17`）、Android NDK、CMake ≥ 3.20、Ninja。
+- [Pass 一览](#pass-一览)
+- [Android Studio 集成指南](#android-studio-集成指南)
+  - [前置要求](#前置要求)
+  - [方案一：CMake 工具链文件（推荐）](#方案一cmake-工具链文件推荐)
+  - [方案二：ndk-build 集成](#方案二ndk-build-集成)
+  - [方案三：手动 clang wrapper](#方案三手动-clang-wrapper)
+- [函数标注方式](#函数标注方式)
+- [YAML 配置文件（无需改源码）](#yaml-配置文件无需改源码)
+- [VMP 虚拟机保护](#vmp-虚拟机保护)
+- [推荐 Pass 组合](#推荐-pass-组合)
+- [常见问题](#常见问题)
 
+---
+
+## Pass 一览
+
+| Pass | 标注 | 说明 |
+|------|------|------|
+| CFFPass | `cff` | 控制流平坦化 —— dispatch-switch 循环 |
+| BCFPass | `bcf` | 虚假控制流 —— 不透明谓词死分支 |
+| OpaquePredicatePass | `op` | 不透明谓词 —— 6 种公式（P0-P2 恒真 / P3-P5 恒假）|
+| SubPass | `sub` | 指令替换 —— 13 种 ADD/SUB/AND/OR/XOR 等价模式 |
+| MBAPass | `mba` | 混合布尔算术重写 —— 10 种公式 |
+| SplitPass | `split` | 基本块拆分 —— 膨胀 CFG |
+| StrEncPass | `strenc` | 字符串加密 —— XOR 密文 + 构造函数解密 |
+| GlobalEncPass | `genc` | 全局整数变量加密 —— XOR 加密初始值 + ctor 解密 |
+| IndirectCallPass | `icall` | 间接调用 —— 不透明指针隐藏调用目标 |
+| IndirectBranchPass | `ibr` | 间接跳转 —— `indirectbr` 隐藏跳转目标 |
+| IndirectGlobalVariablePass | `igv` | 间接全局变量 —— 代理指针隐藏全局变量引用 |
+| SPOPass | `spo` | 栈指针混淆 —— TPIDR_EL0 双读 XOR 破坏 IDA sp_delta (AArch64) |
+| ConstObfPass | `co` | 整数常量混淆 —— XOR-key 分裂隐藏所有数字字面量 |
+| FuncWrapPass | `fw` | 函数包装混淆 —— 内部转发函数隐藏真实调用者 |
+| RetAddrObfPass | `rao` | 返回地址混淆 —— TPIDR_EL0 双读 XOR sub/add SP (AArch64) |
+| OutlinePass | `outline` | 基本块外提 —— 每个非入口 BB 提取为 `__armorcomp_outline_N` |
+| FlattenDataFlowPass | `df` | 数据流平坦化 —— 所有 alloca 合并到单一 `[N x i8]` 池 |
+| DataEncodingPass | `denc` | 局部变量内存编码 —— 每次 store/load 使用 XOR 编解码 |
+| FuncSigObfPass | `fsig` | 函数签名混淆 —— 伪造参数读取 + 返回值写入 (AArch64) |
+| DwarfPoisonPass | `dpoison` | DWARF CFI 表投毒 —— 破坏 IDA `.eh_frame` 分析 (AArch64) |
+| ConditionObfPass | `cob` | 条件比较混淆 —— ICmpInst 操作数加噪 |
+| NeonTypeConfusionPass | `ntc` | NEON/FP 类型混淆 —— `fmov` GPR↔SIMD 误导类型推断 (AArch64) |
+| ReturnValueObfPass | `rvo` | 返回值混淆 —— `eor x0, x0, volatile_zero`（跨平台） |
+| LRObfPass | `lro` | 链接寄存器混淆 —— `eor x30, x30, volatile_zero` (AArch64) |
+| GEPObfPass | `gepo` | GEP 索引混淆 —— 破坏 IDA 结构体 / 数组识别 |
+| SwitchObfPass | `sob` | Switch 混淆 —— 密集跳转表 + `indirectbr` |
+| JunkCodePass | `jci` | 垃圾代码注入 —— 每个 BB 注入不可消除的算术链 |
+| ArithmeticStatePass | `asp` | CFF 状态变量 XOR 编码 —— 防止 IDA 解析状态机 |
+| PointerXorPass | `pxor` | 指针 alloca XOR —— ptrtoint/xor/inttoptr 包装 |
+| FakeAPICallPass | `fapi` | 伪 API 调用注入 —— getpid/getpagesize 噪声 |
+| GlobalPointerObfPass | `gpo` | 全局函数指针加密 —— ctor 双重 XOR 解密 |
+| LoopObfuscationPass | `lob` | 循环混淆 —— 循环入口注入垃圾计算链 |
+| VMPPass | `vmp` | 虚拟机保护 —— 128 寄存器字节码 VM + XTEA 加密 + 完整性校验 + 多态 handler |
+
+---
+
+## Android Studio 集成指南
+
+### 前置要求
+
+| 组件 | 版本要求 | 安装方式 |
+|------|---------|---------|
+| Android Studio | 任意版本（已测试 Hedgehog / Iguana / Jellyfish） | 官网下载 |
+| Android NDK | r25+ (推荐 r26b) | Android Studio SDK Manager |
+| LLVM 17 | Homebrew clang@17 (macOS) 或 clang-17 (Linux) | 见下文 |
+| CMake | >= 3.22 | Android Studio SDK Manager |
+| Ninja | 任意版本 | Android Studio 自带 |
+
+#### 安装 LLVM 17
+
+**macOS (Homebrew):**
 ```bash
-git clone <repo>
-cd ArmorComp
-cmake -B build -G Ninja
-cmake --build build --target ArmorComp
-# → build/libArmorComp.dylib
+brew install llvm@17
+# 验证安装
+/opt/homebrew/opt/llvm@17/bin/clang --version
 ```
 
+**Linux (apt):**
+```bash
+sudo apt install clang-17 libclang-17-dev
+```
+
+> **为什么需要 brew clang@17？**
+>
+> NDK 自带的 clang 是**静态链接** LLVM 的，无法 `dlopen` 加载 pass plugin。
+> ArmorComp 需要动态链接的 clang@17 来加载 `libArmorComp.dylib`。
+> toolchain 中的 launcher 脚本会自动拦截 NDK clang 调用，替换为 brew clang@17 + plugin，
+> 同时保留 NDK 的 `--sysroot`、`--target`、`-resource-dir` 等交叉编译参数。
+
 ---
 
-## 使用方法
+### 方案一：CMake 工具链文件（推荐）
 
-### 方法一 — 源码注解
+这是最简单的集成方式，适用于使用 CMake 构建 native 代码的 Android 项目。
 
-使用 `__attribute__((annotate("...")))` 标记单个函数。无需修改构建系统。
+#### 步骤 1：复制 toolchain 目录
+
+将 ArmorComp 的 `toolchain/` 目录复制到你的 Android 项目中：
+
+```
+your-app/
+├── app/
+│   ├── src/
+│   │   ├── main/
+│   │   │   ├── cpp/
+│   │   │   │   ├── CMakeLists.txt
+│   │   │   │   └── native-lib.cpp
+│   │   │   └── java/
+│   │   └── ...
+│   └── build.gradle
+├── armorcomp/
+│   └── toolchain/            ← 复制到这里
+│       ├── bin/
+│       ├── lib/
+│       │   └── darwin-arm64/libArmorComp.dylib
+│       ├── android.cmake     ← 核心工具链文件
+│       └── ...
+└── build.gradle
+```
+
+#### 步骤 2：修改 app/build.gradle
+
+```groovy
+android {
+    // ...
+
+    defaultConfig {
+        // ...
+        externalNativeBuild {
+            cmake {
+                // 指向 ArmorComp 的 android.cmake 工具链文件
+                arguments "-DCMAKE_TOOLCHAIN_FILE=${rootDir}/armorcomp/toolchain/android.cmake"
+
+                // arm64-v8a: 完整支持全部 33 个 pass
+                // armeabi-v7a: 支持 IR 级 pass（6 个 AArch64 专属自动跳过）
+                abiFilters "arm64-v8a"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+}
+```
+
+> **Kotlin DSL (build.gradle.kts):**
+> ```kotlin
+> android {
+>     defaultConfig {
+>         externalNativeBuild {
+>             cmake {
+>                 arguments(
+>                     "-DCMAKE_TOOLCHAIN_FILE=${rootDir}/armorcomp/toolchain/android.cmake"
+>                 )
+>                 abiFilters("arm64-v8a")
+>             }
+>         }
+>     }
+>     externalNativeBuild {
+>         cmake {
+>             path = file("src/main/cpp/CMakeLists.txt")
+>             version = "3.22.1"
+>         }
+>     }
+> }
+> ```
+
+#### 步骤 3：在 C/C++ 源码中添加标注
 
 ```c
-// 对此函数应用 CFF + BCF + IGV
+// native-lib.c
+
+#include <jni.h>
+#include <string.h>
+
+// 对核心算法启用 CFF + BCF + VMP 保护
 __attribute__((annotate("cff")))
 __attribute__((annotate("bcf")))
-__attribute__((annotate("igv")))
-int verify_license(const char *key) {
-    /* ... */
+__attribute__((annotate("vmp")))
+JNIEXPORT jint JNICALL
+Java_com_example_myapp_MainActivity_verifyLicense(
+    JNIEnv *env, jobject thiz, jstring key) {
+
+    const char *nativeKey = (*env)->GetStringUTFChars(env, key, NULL);
+    int result = 0;
+
+    // 你的核心验证逻辑...
+    if (strcmp(nativeKey, "VALID_KEY") == 0) {
+        result = 1;
+    }
+
+    (*env)->ReleaseStringUTFChars(env, key, nativeKey);
+    return result;
 }
 
-// 对使用字符串字面量的函数进行字符串加密
+// 对字符串加密
 __attribute__((annotate("strenc")))
-void init_keys(void) {
-    const char *api = "SECRET_API_KEY";   // → 在二进制中加密
-    /* ... */
+JNIEXPORT jstring JNICALL
+Java_com_example_myapp_MainActivity_getApiKey(
+    JNIEnv *env, jobject thiz) {
+
+    const char *secret = "sk-AbCdEfGh123456";  // 编译后此字符串会被加密
+    return (*env)->NewStringUTF(env, secret);
 }
 ```
 
-编译：
+#### 步骤 4：构建运行
 
-```bash
-clang -fpass-plugin=build/libArmorComp.dylib \
-      -target aarch64-linux-android21 \
-      --sysroot=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/sysroot \
-      -O0 source.c -o output
+在 Android Studio 中直接点击 **Run** 或 **Build > Make Project**。
+
+构建日志（Build Output）中会看到 ArmorComp 的输出：
+
+```
+[ArmorComp] Plugin:   .../armorcomp/toolchain/lib/darwin-arm64/libArmorComp.dylib
+[ArmorComp] Launcher: .../armorcomp/toolchain/bin/armorcomp-launcher
+[ArmorComp] NDK:      .../Android/sdk/ndk/26.1.10909125
+
+[ArmorComp][CFF] flattened: Java_com_example_myapp_MainActivity_verifyLicense
+[ArmorComp][BCF] obfuscated: Java_com_example_myapp_MainActivity_verifyLicense
+[ArmorComp][VMP] virtualized: Java_com_example_myapp_MainActivity_verifyLicense (N bytecode bytes, M virtual instrs)
+[ArmorComp][StrEnc] encrypted 1 string(s) in module
+```
+
+#### 工作原理
+
+```
+Android Studio
+    ↓
+Gradle → CMake (使用 android.cmake 工具链文件)
+    ↓
+CMake 发现 CMAKE_TOOLCHAIN_FILE → 加载 android.cmake
+    ↓
+android.cmake:
+  1. 定位 NDK toolchain → include(android.toolchain.cmake)
+  2. 定位 libArmorComp.dylib
+  3. 设置 CMAKE_C_COMPILER_LAUNCHER = armorcomp-launcher
+    ↓
+编译时 CMake 调用: armorcomp-launcher <NDK_CLANG> <FLAGS>
+    ↓
+armorcomp-launcher:
+  1. 从 NDK clang 路径推导 resource-dir
+  2. 丢弃 NDK clang，替换为 brew clang@17
+  3. 注入 -fpass-plugin=libArmorComp.dylib
+  4. 保留全部 NDK 编译参数 (--target, --sysroot, ...)
+    ↓
+brew clang@17 -fpass-plugin=libArmorComp.dylib --target=aarch64-linux-android21 ...
+    ↓
+LLVM 17 加载 ArmorComp → 运行各 pass → 输出混淆后的 .o
+    ↓
+NDK linker 链接 → libmynativelib.so (混淆后的 native library)
 ```
 
 ---
 
-### 方法二 — YAML 配置文件（无需修改源码）
+### 方案二：ndk-build 集成
 
-通过 YAML 配置文件选择函数和 pass。无需 `__attribute__`。适用于保护第三方代码或无法修改源文件的情况。
+适用于仍在使用 `Android.mk` / `ndk-build` 的旧项目。
 
-#### 激活
+#### Android.mk
 
-在运行 clang 之前设置 `ARMORCOMP_CONFIG` 环境变量：
+```makefile
+LOCAL_PATH := $(call my-dir)
+include $(CLEAR_VARS)
 
-```bash
-export ARMORCOMP_CONFIG=/path/to/armorcomp.yaml
+LOCAL_MODULE    := mynativelib
+LOCAL_SRC_FILES := native-lib.cpp secure_logic.c
 
-clang -fpass-plugin=build/libArmorComp.dylib \
-      -target aarch64-linux-android21 \
-      --sysroot=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/sysroot \
-      -O0 source.c -o output
+# 引入 ArmorComp 工具链
+include $(LOCAL_PATH)/../../armorcomp/toolchain/armorcomp.mk
+
+include $(BUILD_SHARED_LIBRARY)
 ```
 
-> **为什么使用环境变量而不是 `-mllvm -armorcomp-config=...`？**
-> clang 在 LLVM 后端初始化期间加载 `-fpass-plugin` DSO，这发生在
-> `cl::ParseCommandLineOptions()` 已经运行**之后**。插件注册的 `cl::opt`
-> 因此无法接收来自 `-mllvm` 标志的值。环境变量在第一次 pass 调用时读取，
-> 那时 DSO 已加载完毕——没有顺序问题。
+#### Application.mk
 
-自动发现：如果未设置 `ARMORCOMP_CONFIG`，ArmorComp 会在当前工作目录中查找
-`armorcomp.yaml`。
+```makefile
+APP_ABI      := arm64-v8a
+APP_PLATFORM := android-21
+```
+
+`armorcomp.mk` 会自动将 `TARGET_CC` / `TARGET_CXX` 替换为 ArmorComp 的 clang wrapper。
+
+---
+
+### 方案三：手动 clang wrapper
+
+适用于不使用 CMake/ndk-build 的自定义构建系统，或需要精确控制编译参数的场景。
+
+```bash
+# 直接使用 armorcomp-clang 编译单个文件
+./armorcomp/toolchain/bin/armorcomp-clang \
+    --target=aarch64-linux-android21 \
+    --sysroot=$ANDROID_NDK/toolchains/llvm/prebuilt/darwin-x86_64/sysroot \
+    -O0 \
+    -c native-lib.c -o native-lib.o
+
+# 链接（使用 NDK linker）
+$ANDROID_NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/ld.lld \
+    native-lib.o -o libmynativelib.so -shared \
+    --sysroot=$ANDROID_NDK/toolchains/llvm/prebuilt/darwin-x86_64/sysroot
+```
+
+---
+
+## 函数标注方式
+
+使用 `__attribute__((annotate("pass_name")))` 标记需要保护的函数：
+
+```c
+// 单个 pass
+__attribute__((annotate("cff")))
+int my_function(int x) { ... }
+
+// 多个 pass —— 逐个叠加
+__attribute__((annotate("cff")))
+__attribute__((annotate("bcf")))
+__attribute__((annotate("sub")))
+__attribute__((annotate("mba")))
+int highly_protected(int x) { ... }
+
+// C++ 便捷宏
+#define ARMORCOMP(...) __attribute__((annotate("cff"))) \
+                       __attribute__((annotate("bcf"))) \
+                       __attribute__((annotate("sub")))
+
+ARMORCOMP()
+int my_cpp_function(int x) { ... }
+```
+
+**可用标注值：**
+`cff` `bcf` `op` `sub` `mba` `cob` `split` `strenc` `genc` `denc` `jci` `fapi` `icall` `ibr` `igv` `spo` `co` `gepo` `fw` `rao` `outline` `df` `fsig` `dpoison` `ntc` `rvo` `lro` `sob` `asp` `pxor` `gpo` `lob` `vmp`
+
+---
+
+## YAML 配置文件（无需改源码）
+
+适用于保护第三方库或不方便修改源码的场景。
+
+#### 激活方式
+
+```bash
+# 方式 1: 环境变量
+export ARMORCOMP_CONFIG=/path/to/armorcomp.yaml
+
+# 方式 2: 自动发现（工作目录下的 armorcomp.yaml）
+# 在项目根目录放置 armorcomp.yaml 即可
+```
+
+在 Android Studio 中设置环境变量，可以在 `build.gradle` 中添加：
+
+```groovy
+android {
+    defaultConfig {
+        externalNativeBuild {
+            cmake {
+                arguments "-DCMAKE_TOOLCHAIN_FILE=${rootDir}/armorcomp/toolchain/android.cmake"
+                abiFilters "arm64-v8a"
+            }
+        }
+    }
+}
+
+// 设置 ArmorComp 配置文件环境变量
+tasks.matching { it.name.contains("externalNativeBuild") }.configureEach {
+    environment("ARMORCOMP_CONFIG", "${rootDir}/armorcomp.yaml")
+}
+```
 
 #### 配置文件格式
 
@@ -122,109 +385,226 @@ clang -fpass-plugin=build/libArmorComp.dylib \
 # armorcomp.yaml
 
 functions:
-  # 规则 1 — 精确函数名
-  - name: "verify_license"
-    passes: [cff, bcf, sub, mba, icall, ibr, igv, rao, fw, spo]
+  # 精确函数名匹配
+  - name: "Java_com_example_Crypto_decrypt"
+    passes: [cff, bcf, vmp, icall, ibr]
 
-  # 规则 2 — POSIX ERE 模式（建议锚定）
+  # 正则模式 —— 保护所有 JNI 导出
   - pattern: "^Java_"
-    passes: [cff, bcf, icall, ibr]
+    passes: [cff, sub, co, mba]
 
-  # 规则 3 — 保护名称包含 "secret" 的任何函数
-  - pattern: "secret"
-    passes: [strenc, split, sub, cff]
+  # 保护名字包含 "secure" 的函数
+  - pattern: "secure"
+    passes: [cff, bcf, op, mba, spo]
 ```
 
-**字段：**
-
-| 字段 | 类型 | 描述 |
-|-------|------|-------------|
-| `name` | 字符串 | 精确函数名。与 `pattern` 互斥。 |
-| `pattern` | 字符串 | 与函数名匹配的 POSIX ERE。与 `name` 互斥。 |
-| `passes` | 列表 | 要应用的 pass 名称。有效值：`cff bcf op sub mba cob split strenc genc denc jci icall ibr igv spo co gepo fw rao outline df fsig dpoison ntc rvo lro sob vmp` |
-
-**评估规则：**
-
-- 规则按**从上到下**评估；**第一个匹配的规则获胜**。
-- 配置与 `__attribute__((annotate(...)))` 是**累加**的：如果注解或配置规则选择了 pass，函数就会被转换。
-- 如果没有规则匹配且没有注解，函数保持不变。
-
-#### 验证配置选择
-
-加载配置时，插件会向 stderr 打印摘要：
-
-```
-[ArmorComp][Config] loaded 3 rule(s) from "/path/to/armorcomp.yaml"
-[ArmorComp][BCF] obfuscated: verify_license
-[ArmorComp][CFF] flattened:  verify_license
-[ArmorComp][IGV] indirected: verify_license (4 accesses, 2 globals)
-[ArmorComp][RAO] obfuscated: verify_license (N calls)
-[ArmorComp][FW]  wrapped:    verify_license (N calls, M wrappers)
-[ArmorComp][SPO] obfuscated: verify_license (1 ret(s))
-```
-
-未被任何规则匹配的函数不会产生混淆日志行。
+**规则说明：**
+- 从上到下匹配，**首个匹配的规则生效**
+- 配置与 `annotate()` 标注是**叠加**关系，任一触发即生效
+- 无匹配且无标注的函数不受影响
 
 ---
 
-## 测试目标
+## VMP 虚拟机保护
+
+VMPPass 是保护强度最高的 pass。它将整个函数体转换为自定义字节码虚拟机：
+
+```
+LLVM IR → VMPLifter (字节码) → Opcode 置乱 → XTEA-CTR 加密 → VMPCodeGen (调度器)
+```
+
+### VM 指令集
+
+- **128 个虚拟寄存器** (R0–R127)，64 位宽，支持死寄存器回收
+- R0 = 返回值，R0–R7 = 函数参数
+- **~50 个操作码**：算术、位运算、比较（10 ICmp + 14 FCmp）、控制流、内存访问（8/16/32/64）、类型转换、浮点、指针、原子操作、直接/间接调用
+- **超级指令** ADD_I32/SUB_I32 —— 7 字节融合立即数算术
+
+### 保护层级
+
+| 层 | 机制 | 效果 |
+|---|------|------|
+| Opcode 置乱 | Fisher-Yates 全排列（每个函数独立种子）| 每个函数的 opcode 编码都不同 |
+| XTEA-CTR 加密 | 32 轮 XTEA 分组密码 CTR 模式（每函数独立密钥）| 字节码静态加密，运行时解密 |
+| 完整性校验 | FNV-1a 哈希 | 篡改检测 → `llvm.trap` |
+| 寄存器 Canary | 寄存器读写 XOR 掩码 | 防止直接操纵寄存器文件 |
+| Dead Handler | 16 个虚假 handler BB（4 种模板）| IDA 无法区分真假 handler |
+| Handler 多态 | 6 个高频 handler 使用 MBA 等价表达式 | 每个函数使用不同 handler 实现 |
+| VarArg 支持 | 自动生成 non-vararg wrapper | printf/snprintf 等可被虚拟化 |
+
+### VMP 调试
+
+设置环境变量查看字节码反汇编输出：
 
 ```bash
-cmake --build build --target test-cff      # 控制流扁平化
-cmake --build build --target test-bcf      # 虚假控制流
-cmake --build build --target test-op       # 不透明谓词插入
-cmake --build build --target test-sub      # 指令替换
-cmake --build build --target test-mba      # 混合布尔算术
-cmake --build build --target test-strenc   # 字符串加密
-cmake --build build --target test-icall    # 间接调用
-cmake --build build --target test-ibr      # 间接分支
-cmake --build build --target test-igv      # 间接全局变量
-cmake --build build --target test-spo      # 栈指针混淆（IDA sp 分析失败）
-cmake --build build --target test-co       # 整数常量混淆（无裸立即数）
-cmake --build build --target test-fw       # 函数包装混淆（调用图间接化）
-cmake --build build --target test-rao      # 返回地址/调用帧混淆（每个 call 处 sp_delta UNKNOWN）
-cmake --build build --target test-outline  # 基本块提取（__armorcomp_outline_N 辅助函数）
-cmake --build build --target test-df       # 数据流扁平化（栈池合并）
-cmake --build build --target test-genc     # 整数全局变量加密（ctor 解密器）
-cmake --build build --target test-denc     # 整数局部变量内存编码（store/load XOR 包装）
-cmake --build build --target test-fsig     # 函数签名混淆（IDA 原型分析失败）
-cmake --build build --target test-dpoison  # DWARF CFI 表污染（通过 .eh_frame 的 sp_delta UNKNOWN）
-cmake --build build --target test-cob      # 比较混淆（ICmpInst 噪声，IDA 条件无法解析）
-cmake --build build --target test-ntc      # NEON/FP 类型混淆（fmov GPR↔SIMD，IDA float 类型注解）
-cmake --build build --target test-rvo      # 返回值混淆（eor x0/w0，IDA 返回类型未知）
-cmake --build build --target test-lro      # 链接寄存器混淆（eor x30，IDA 调用者引用破坏，仅 AArch64）
-cmake --build build --target test-gepo     # GEP 索引混淆（字节偏移 XOR，IDA 结构/数组布局无法恢复）
-cmake --build build --target test-sob      # Switch 混淆（密集跳转表 + indirectbr，IDA JUMPOUT）
-cmake --build build --target test-jci      # 垃圾代码注入（每个 BB 的死运算链，额外 Hex-Rays 变量）
-cmake --build build --target test-vmp      # 虚拟机保护（64 寄存器字节码 VM，分发器隐藏算法）
-cmake --build build --target test-config   # YAML 配置文件（无注解）
+ARMORCOMP_VMP_DISASM=1 ./gradlew assembleDebug 2>&1 | grep -A 20 "Disassembly of"
 ```
 
-每个目标编译对应的 `test/*.c` 文件到 ARM64 Android ELF。在设备/模拟器上运行；每个测试的预期输出以 `ALL TESTS PASSED` 结尾。
+输出示例：
+```
+[VMP] Disassembly of Java_com_example_Crypto_decrypt:
+  [0000] JMP     +1
+  [0005] NOP
+  [0006] ALLOCA  R8, 4
+  [000c] STORE_32 R0, R8
+  [000f] LOAD_32  R9, R8
+  [0012] ADD_I32  R8, R9, 42
+  [0019] RET      R8
+```
 
-`test-config` 目标使用 `ARMORCOMP_CONFIG=test/config_test.yaml` 和
-`test/config_test.c`，该文件**零** `__attribute__((annotate(...)))`——所有
-混淆完全由 YAML 配置驱动。
+### VMP 限制
+
+- SIMD / 向量指令 → 不支持（函数会被跳过）
+- 带浮点参数的间接调用 → 不支持（ABI 限制）
+- 动态大小 alloca → 不支持
 
 ---
 
-## 组合两种方法
+## 推荐 Pass 组合
 
-注解和配置规则可以协同工作。例如：配置保护项目中所有
-`Java_*` 导出；单个函数通过注解添加额外层。
+在 Android arm64-v8a 上测试验证通过：
 
-```yaml
-# armorcomp.yaml — 项目级基线
-functions:
-  - pattern: "^Java_"
-    passes: [cff, bcf, icall]
+| 目标 | 组合 | 效果 |
+|------|------|------|
+| 直接破坏 IDA F5 | `spo + rao + dpoison` | sp_delta = UNKNOWN → 反编译器失败 |
+| F5 输出不可读 | `cff + bcf + mba` | 状态机迷宫，条件不可解析 |
+| 最强保护 | `vmp + spo + dpoison` | 算法隐藏在 VM 中 + wrapper sp 被破坏 |
+| 全栈 | `spo + rao + cff + bcf + mba + dpoison` | 所有反分析层叠加 |
+
+> **注意：** VMP + CFF **不应组合** —— CFF 会二次展平 VMP 调度器的 switch，导致 `musttail` 不变式冲突。
+
+---
+
+## 自动执行顺序
+
+当使用标注模式时，pass 的执行顺序为：
+
+```
+STRENC → GENC → GPO → VMP → SOB → SPLIT → SUB → MBA → LOB →
+COB → DENC → PXOR → JCI → FAPI → CO → GEPO → DF → OUTLINE →
+BCF → OP → CFF → ASP → RAO → ICALL → IBR → IGV → FW → FSIG →
+SPO → NTC → RVO → LRO → DPOISON
 ```
 
-```c
-// 在配置基线之上添加额外层
-__attribute__((annotate("igv")))   // IGV 不在配置中 → 由注解添加
-__attribute__((annotate("sub")))
-JNIEXPORT jint JNICALL Java_com_example_App_verify(JNIEnv *env, jobject obj) {
-    /* 来自配置的 cff+bcf+icall，来自注解的 igv+sub */
-}
+每个 pass 还有 `-all` 变体（如 `armorcomp-cff-all`），无需标注即应用到所有函数。
+
+---
+
+## 常见问题
+
+### Q: Android Studio 构建报错 "plugin not found"
+
+**原因：** `toolchain/lib/darwin-arm64/libArmorComp.dylib` 不存在。
+
+**解决：**
+```bash
+# 从源码构建
+cd ArmorComp
+cmake -B build -G Ninja
+cmake --build build --target ArmorComp
+cp build/libArmorComp.dylib toolchain/lib/darwin-arm64/
 ```
+
+### Q: 报错 "no suitable clang found"
+
+**原因：** 未安装 Homebrew LLVM 17。
+
+**解决：**
+```bash
+brew install llvm@17
+# 验证
+/opt/homebrew/opt/llvm@17/bin/clang --version
+```
+
+### Q: 构建成功但没有混淆日志输出
+
+**原因：**
+1. 没有添加 `__attribute__((annotate(...)))` 标注
+2. 也没有设置 YAML 配置文件
+
+**解决：** 至少使用一种标注方式。如果使用 YAML，确保 `ARMORCOMP_CONFIG` 环境变量已设置。
+
+### Q: 某些函数被 VMP 跳过 (skipped)
+
+**原因：** 函数中包含 VMP 不支持的 IR 指令（SIMD 向量运算、动态 alloca 等）。
+
+**解决：**
+- 检查 stderr 中的 `[ArmorComp][VMP] skipped (unsupported IR): <函数名>`
+- 对这些函数改用其他 pass（如 `cff + bcf + mba`）
+
+### Q: macOS Intel (x86_64) 和 Linux 怎么使用？
+
+toolchain 支持三种平台：
+
+| 平台 | Plugin 路径 |
+|------|------------|
+| macOS Apple Silicon | `toolchain/lib/darwin-arm64/libArmorComp.dylib` |
+| macOS Intel | `toolchain/lib/darwin-x86_64/libArmorComp.dylib` |
+| Linux x86_64 | `toolchain/lib/linux-x86_64/libArmorComp.so` |
+
+`android.cmake` 和 launcher 会自动检测当前平台并使用对应的 plugin 文件。
+
+### Q: 能同时支持 arm64 和 arm32 吗？
+
+可以。在 `build.gradle` 中设置：
+
+```groovy
+abiFilters "arm64-v8a", "armeabi-v7a"
+```
+
+arm32 编译时，6 个 AArch64 专属 pass（`spo` / `rao` / `ntc` / `lro` / `fsig` / `dpoison`）会自动跳过，其余 27 个 pass 正常工作。
+
+### Q: 如何验证混淆效果？
+
+1. **编译日志** —— 查看 stderr 中各 pass 的输出确认已生效
+2. **反汇编对比** —— 用 IDA Pro / Ghidra 打开混淆前后的 `.so` 文件
+3. **运行时测试** —— 确保混淆后功能不变（所有 pass 保证语义等价）
+4. **VMP 反汇编器** —— `ARMORCOMP_VMP_DISASM=1` 查看字节码
+
+### Q: 使用 ArmorComp 后 APK 体积增大了多少？
+
+取决于使用的 pass 和标注的函数数量：
+- 轻量级（`cff + sub + mba`）：通常增大 10-30%
+- 中等级（`cff + bcf + op + mba + icall + ibr`）：增大 50-100%
+- VMP：每个虚拟化函数生成 ~60 个 handler BB 的调度器，增大较多，建议只对核心函数使用
+
+### Q: 能和 ProGuard / R8 一起使用吗？
+
+可以。ProGuard/R8 只作用于 Java/Kotlin 字节码，ArmorComp 作用于 native C/C++ 代码，两者互不干扰。推荐同时使用以获得全栈保护。
+
+---
+
+## iOS 集成
+
+### CMake 方式
+
+```bash
+cmake -DCMAKE_TOOLCHAIN_FILE=/path/to/toolchain/ios.cmake \
+      -DIOS_PLATFORM=OS64 \
+      -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+      ..
+```
+
+### Xcode (.xcconfig) 方式
+
+1. 将 `ArmorComp.xcconfig` 添加到 Xcode 项目
+2. 在 target 的 Build Settings → "Based on" 中选择 `ArmorComp`
+3. 设置 `ARMORCOMP_TOOLCHAIN_DIR` 为 toolchain 目录的绝对路径
+
+详见 `toolchain/ArmorComp.xcconfig` 文件中的注释。
+
+---
+
+## 从源码构建
+
+```bash
+git clone <repo>
+cd ArmorComp
+cmake -B build -G Ninja
+cmake --build build --target ArmorComp
+# 部署到 toolchain
+cp build/libArmorComp.dylib toolchain/lib/darwin-arm64/
+```
+
+> **重要：** 修改 pass 源码后必须重新部署到 `toolchain/lib/` 目录，
+> 因为 launcher 使用的是 `toolchain/lib/` 下的插件，不是 `build/` 下的。

@@ -145,8 +145,14 @@ PreservedAnalyses LRObfPass::run(Function &F,
   // ── Snapshot return instructions ──────────────────────────────────────────
   std::vector<ReturnInst *> rets;
   for (BasicBlock &BB : F)
-    if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+    if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
+      // Guard: skip if preceding instruction is a musttail call (VMP thunk).
+      // Inserting eor x30 before ret would break the musttail → ret invariant.
+      Instruction *Prev = RI->getPrevNode();
+      if (Prev && isa<CallInst>(Prev) && cast<CallInst>(Prev)->isMustTailCall())
+        continue;
       rets.push_back(RI);
+    }
 
   if (rets.empty()) return PreservedAnalyses::all();
 

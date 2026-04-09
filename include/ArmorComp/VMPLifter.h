@@ -145,6 +145,25 @@ private:
   // Seeded from the function name so each function gets unique junk patterns.
   uint64_t junkRng = 0;
 
+  // ── Dead register reclamation ─────────────────────────────────────────────
+  std::unordered_map<llvm::Value *, unsigned> lastUseOrder; // Value → last use instr idx
+  std::vector<uint8_t>                        freeRegs;     // recyclable register pool
+  std::unordered_map<uint8_t, llvm::Value *>  regToValue;   // register → Value reverse map
+  unsigned currentInstrIdx = 0;                             // monotonic instruction counter
+  bool regExhausted = false;                                // set when register pool empty
+
+  // ── CmpXchg result register pairs ─────────────────────────────────────
+  // Maps CmpXchgInst → (oldValueReg, successFlagReg) for ExtractValue.
+  std::unordered_map<llvm::Instruction *, std::pair<uint8_t, uint8_t>> cmpxchgRegs;
+
+  // Pre-scan: compute last-use instruction index for each Value in F.
+  void computeLastUses(llvm::Function &F);
+  // Reclaim registers whose Value's last use is at or before currentInstrIdx.
+  void reclaimDeadRegs();
+  // Allocate an anonymous scratch register (not mapped to any Value).
+  // Caller must push_back to freeRegs when done.
+  uint8_t allocScratchReg();
+
   // ── Internal helpers ─────────────────────────────────────────────────────
 
   // Pre-pass: build phiMovs table from all PHI nodes in F.
@@ -173,6 +192,11 @@ private:
 
   // Emit a JMP or JCC for BranchInst.
   void emitBranch(std::vector<uint8_t> &bc, llvm::BranchInst &BI,
+                  llvm::BasicBlock *curBB);
+
+  // Lower SwitchInst to cascading ICmp_EQ + JCC, then JMP default.
+  // Returns false if any case value cannot be materialised.
+  bool emitSwitch(std::vector<uint8_t> &bc, llvm::SwitchInst &SI,
                   llvm::BasicBlock *curBB);
 
   // Handle LLVM intrinsic calls:

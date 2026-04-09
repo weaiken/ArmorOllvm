@@ -87,26 +87,35 @@ PreservedAnalyses VMPPass::run(Function &F, FunctionAnalysisManager & /*AM*/) {
   std::vector<uint8_t> bc = *bcOpt;
   unsigned virtInstrs = lifter.virtualInstrCount();
 
-  // ── Per-function opcode scramble + XOR encryption ────────────────────────
+  // ── Per-function opcode scramble + XTEA encryption ──────────────────────
   std::string fnName = F.getName().str();
 
-  // 1. Opcode randomisation: semantic byte → physical byte (Fisher-Yates on
+  // 1. Optional disassembly output (before scramble, so opcodes are semantic).
+  if (getenv("ARMORCOMP_VMP_DISASM")) {
+    std::string disasm;
+    armorcomp::vmp::disassembleBytecode(bc, disasm);
+    errs() << "[VMP] Disassembly of " << F.getName() << ":\n" << disasm;
+  }
+
+  // 2. Opcode randomisation: semantic byte → physical byte (Fisher-Yates on
   //    a permutation seeded by fnvHash(fnName + "_vmp_opmap")).
   armorcomp::vmp::OpcodeMap opcodeMap = armorcomp::vmp::genOpcodeMap(fnName);
   armorcomp::vmp::scrambleBytecode(bc, opcodeMap);
 
-  // 2. XOR encryption: 8-byte repeating key derived from fnvHash(fnName +
-  //    "_vmp_bckey").  Dispatcher decrypts into a stack buffer before
-  //    entering the fetch-decode-execute loop.
-  uint64_t bcKey = armorcomp::vmp::genBcKey(fnName);
-  armorcomp::vmp::encryptBytecode(bc, bcKey);
+  // 3. Bytecode integrity hash (FNV-1a over scrambled, pre-encryption bytes).
+  //    The dispatcher re-computes this after decryption and traps on mismatch.
+  uint64_t bcHash = armorcomp::vmp::hashBytecode(bc);
+
+  // 4. XTEA-CTR encryption: replaces 8-byte XOR with 32-round XTEA cipher.
+  armorcomp::vmp::XTEAKey xteaKey = armorcomp::vmp::genXTEAKey(fnName);
+  armorcomp::vmp::encryptBytecodeXTEA(bc, xteaKey);
 
   // ── Inject bytecode + generate dispatcher ────────────────────────────────
   Module *M = F.getParent();
   armorcomp::vmp::VMPCodeGen codegen(*M);
 
   if (!codegen.virtualize(F, bc, lifter.getGVTable(), lifter.getCallTable(),
-                           bcKey, opcodeMap)) {
+                           xteaKey, opcodeMap, bcHash)) {
     errs() << "[ArmorComp][VMP] codegen failed: " << F.getName() << "\n";
     return PreservedAnalyses::all();
   }
